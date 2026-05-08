@@ -22,8 +22,8 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
-from urllib.request import Request, urlopen
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from fastapi import FastAPI
@@ -32,7 +32,6 @@ from pydantic import BaseModel, Field
 
 from browser_use import BrowserProfile, BrowserSession
 from browser_use.browser.events import SwitchTabEvent
-
 
 ChatProvider = Literal['gemini', 'gpt']
 ChatMode = Literal['fast', 'reasoning', 'pro']
@@ -170,10 +169,23 @@ RATE_LIMIT_KEYWORDS = (
 	'too many requests',
 	'quota',
 	'limit reached',
+	'usage limit',
+	'usage cap',
+	'capacity',
 	'try again later',
 	'temporarily unavailable',
 	'you have reached',
 	'please wait',
+	'image limit',
+	'image generation limit',
+	'image creation limit',
+	'free plan limit',
+	'upgrade to plus',
+	'daily limit',
+	'hourly limit',
+	'request limit',
+	'exceeded your current quota',
+	'resource has been exhausted',
 )
 
 ERROR_KEYWORDS = (
@@ -186,6 +198,7 @@ ERROR_KEYWORDS = (
 
 
 IMAGE_TOOL_KEYWORDS = ('create image', 'generate image', 'image')
+STREAM_SETTLE_GRACE_SECONDS = 12.0
 
 
 SNAPSHOT_JS = r"""
@@ -297,6 +310,7 @@ SNAPSHOT_JS = r"""
 	}
 
 	const lastResponseText = responseTexts.length > 0 ? responseTexts[responseTexts.length - 1] : '';
+	const responseTextsTail = responseTexts.slice(-4);
 
 	return {
 		url: location.href,
@@ -309,6 +323,7 @@ SNAPSHOT_JS = r"""
 		activeModeText,
 		responseCount: responseTexts.length,
 		lastResponseText: lastResponseText.slice(0, 30000),
+		responseTextsTail: responseTextsTail.map((t) => t.slice(0, 30000)),
 		errorTexts: errorTexts.slice(0, 8)
 	};
 })();
@@ -965,6 +980,8 @@ class GeminiBridgeService:
 			candidates = await self._wait_for_images(
 				session=session,
 				baseline_count=int(baseline.get('imageCount') or 0),
+				baseline_candidates=list(baseline.get('imageCandidates') or []),
+				desired_count=max_images,
 				timeout_s=effective_timeout,
 			)
 
@@ -1104,13 +1121,22 @@ class GeminiBridgeService:
 		timeout_s: float,
 	) -> str:
 		started = time.time()
+		deadline = started + timeout_s
 		stable_count = 0
-		last_seen = ''
+		last_seen_signature = ''
 		saw_new_response = False
 		transient_eval_timeouts = 0
 		saw_streaming = False
+		last_streaming_at = 0.0
+		best_answer = ''
+		best_signature = ''
+		baseline_norm = baseline_last.strip()
 
-		while time.time() - started <= timeout_s:
+		while True:
+			now = time.time()
+			if now > deadline:
+				if not (saw_streaming and last_streaming_at > 0 and now <= last_streaming_at + STREAM_SETTLE_GRACE_SECONDS):
+					break
 			try:
 				snapshot = await self._snapshot(session)
 			except AutomationError as e:
@@ -1140,27 +1166,41 @@ class GeminiBridgeService:
 
 			response_count = int(snapshot.get('responseCount') or 0)
 			last_text = str(snapshot.get('lastResponseText') or '').strip()
+			tail_texts = [str(x).strip() for x in (snapshot.get('responseTextsTail') or []) if str(x).strip()]
 			is_streaming = bool(snapshot.get('isStreaming'))
 			if is_streaming:
 				saw_streaming = True
+				last_streaming_at = time.time()
+
+			new_tail = [t for t in tail_texts if t != baseline_norm]
+			candidate_texts = new_tail if new_tail else ([last_text] if last_text and last_text != baseline_norm else [])
+			candidate_text = candidate_texts[-1] if candidate_texts else ''
+			candidate_signature = json.dumps(candidate_texts[-2:], ensure_ascii=False)
+			if candidate_text and (len(candidate_text) >= len(best_answer) or candidate_signature != best_signature):
+				best_answer = candidate_text
+				best_signature = candidate_signature
 
 			new_by_count = response_count > baseline_count
-			new_by_text = bool(last_text) and last_text != baseline_last
-			new_after_stream = saw_streaming and bool(last_text)
+			new_by_text = bool(candidate_text)
+			new_after_stream = saw_streaming and bool(best_answer)
 			if new_by_count or new_by_text or new_after_stream:
 				saw_new_response = True
 
-			if saw_new_response and last_text:
-				if last_text == last_seen:
+			if saw_new_response and best_answer:
+				signature = candidate_signature if candidate_signature != '[]' else best_signature
+				if signature and signature == last_seen_signature:
 					stable_count += 1
 				else:
 					stable_count = 0
 
-				last_seen = last_text
-				if stable_count >= self.cfg.stable_polls:
-					return last_text
+				last_seen_signature = signature
+				if stable_count >= self.cfg.stable_polls and not is_streaming:
+					return best_answer
 
 			await asyncio.sleep(self.cfg.poll_interval_s)
+
+		if best_answer:
+			return best_answer
 
 		raise AutomationError(
 			f'{self.cfg.provider.upper()}_RESPONSE_TIMEOUT',
@@ -1180,15 +1220,25 @@ class GeminiBridgeService:
 		*,
 		session: BrowserSession,
 		baseline_count: int,
+		baseline_candidates: list[dict[str, Any]],
+		desired_count: int,
 		timeout_s: float,
 	) -> list[dict[str, Any]]:
 		started = time.time()
+		deadline = started + timeout_s
 		stable_count = 0
 		last_signature = ''
 		transient_eval_timeouts = 0
 		last_candidates: list[dict[str, Any]] = []
+		baseline_keys = {self._candidate_key(candidate) for candidate in baseline_candidates}
+		last_streaming_at = 0.0
+		saw_streaming = False
 
-		while time.time() - started <= timeout_s:
+		while True:
+			now = time.time()
+			if now > deadline:
+				if not (saw_streaming and last_streaming_at > 0 and now <= last_streaming_at + STREAM_SETTLE_GRACE_SECONDS):
+					break
 			try:
 				snapshot = await self._snapshot_images(session)
 			except AutomationError as e:
@@ -1213,23 +1263,32 @@ class GeminiBridgeService:
 						f'{self.cfg.provider.upper()}_IMAGE_UI_ERROR',
 						f'{self.cfg.display_name} reported an image-generation UI error.',
 						status_code=502,
-						details={'errors': error_texts[:5]},
+					details={'errors': error_texts[:5]},
 					)
 
 			candidate_count = int(snapshot.get('imageCount') or 0)
+			is_streaming = bool(snapshot.get('isStreaming'))
+			if is_streaming:
+				saw_streaming = True
+				last_streaming_at = time.time()
+
 			candidates = list(snapshot.get('imageCandidates') or [])
-			if candidate_count > baseline_count and candidates:
-				current_signature = json.dumps(candidates[:4], sort_keys=True)
+			new_candidates = [candidate for candidate in candidates if self._candidate_key(candidate) not in baseline_keys]
+			if (candidate_count > baseline_count or new_candidates) and new_candidates:
+				current_signature = json.dumps(new_candidates[:4], sort_keys=True)
 				if current_signature == last_signature:
 					stable_count += 1
 				else:
 					stable_count = 0
 				last_signature = current_signature
-				last_candidates = candidates
-				if stable_count >= self.cfg.stable_polls:
-					return candidates
+				last_candidates = new_candidates
+				if stable_count >= self.cfg.stable_polls and (len(new_candidates) >= desired_count or not is_streaming):
+					return new_candidates
 
 			await asyncio.sleep(self.cfg.poll_interval_s)
+
+		if last_candidates:
+			return last_candidates
 
 		raise AutomationError(
 			f'{self.cfg.provider.upper()}_IMAGE_TIMEOUT',
@@ -1242,6 +1301,11 @@ class GeminiBridgeService:
 				'transient_eval_timeouts': transient_eval_timeouts,
 			},
 		)
+
+	def _candidate_key(self, candidate: dict[str, Any]) -> str:
+		width = _to_int(str(candidate.get('width')) if candidate.get('width') is not None else None, 0)
+		height = _to_int(str(candidate.get('height')) if candidate.get('height') is not None else None, 0)
+		return f"{str(candidate.get('sourceUrl') or '')}|{width}|{height}"
 
 	async def _persist_generated_image(self, *, request_id: str, index: int, payload: dict[str, Any]) -> GeneratedImage:
 		return await asyncio.to_thread(
@@ -1399,9 +1463,9 @@ app = FastAPI(
 	title='Browser Chat Bridge',
 	version='2.0.0',
 	lifespan=lifespan,
-	docs_url=None,
+	docs_url='/docs',
 	redoc_url=None,
-	openapi_url=None,
+	openapi_url='/openapi.json',
 )
 
 
