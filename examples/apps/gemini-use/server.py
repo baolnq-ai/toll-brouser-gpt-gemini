@@ -18,6 +18,9 @@ import json
 import logging
 import mimetypes
 import os
+import shutil
+import subprocess
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -41,6 +44,11 @@ def _to_bool(value: str | None, default: bool = False) -> bool:
 	if value is None:
 		return default
 	return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _auto_launch_chrome_enabled() -> bool:
+	raw = os.getenv('CHAT_BRIDGE_AUTO_LAUNCH_CHROME', os.getenv('AUTO_LAUNCH_CHROME'))
+	return _to_bool(raw, default=True)
 
 
 def _to_float(value: str | None, default: float) -> float:
@@ -101,6 +109,116 @@ def _probe_cdp_sync(cdp_url: str) -> tuple[bool, dict[str, Any]]:
 			return True, {}
 	except Exception:
 		return False, {}
+
+
+def _is_local_cdp_host(host: str | None) -> bool:
+	if host is None:
+		return True
+	normalized = host.strip().lower()
+	return normalized in {'127.0.0.1', 'localhost', '::1'}
+
+
+def _find_chrome_executable() -> str | None:
+	env_candidates = [
+		os.getenv('CHAT_BRIDGE_CHROME_BIN'),
+		os.getenv('GEMINI_CHROME_BIN'),
+		os.getenv('CHROME_BIN'),
+	]
+	for candidate in env_candidates:
+		if candidate and os.path.isfile(candidate):
+			return candidate
+
+	if os.name == 'nt':
+		windows_candidates = [
+			r'C:\Program Files\Google\Chrome\Application\chrome.exe',
+			r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
+			r'C:\Program Files\Chromium\Application\chrome.exe',
+			r'C:\Program Files (x86)\Chromium\Application\chrome.exe',
+			r'C:\Program Files\Microsoft\Edge\Application\msedge.exe',
+			r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
+		]
+		for candidate in windows_candidates:
+			if os.path.isfile(candidate):
+				return candidate
+
+	for binary_name in ('google-chrome', 'chrome', 'chromium', 'chromium-browser', 'msedge'):
+		resolved = shutil.which(binary_name)
+		if resolved:
+			return resolved
+
+	return None
+
+
+def _chrome_profile_dir_for_port(port: int) -> str:
+	base_dir = (
+		os.getenv('CHAT_BRIDGE_CHROME_PROFILE_DIR')
+		or os.getenv('GEMINI_CHROME_PROFILE_DIR')
+		or os.path.join(tempfile.gettempdir(), 'browser-use-chat-bridge')
+	)
+	return os.path.join(base_dir, f'cdp-{port}')
+
+
+def _launch_local_chrome_cdp_sync(cdp_url: str, port: int) -> dict[str, Any]:
+	parsed = urlparse(cdp_url)
+	host = parsed.hostname or '127.0.0.1'
+	if not _is_local_cdp_host(host):
+		return {'attempted': False, 'reason': 'non_local_cdp_host', 'host': host}
+
+	chrome_bin = _find_chrome_executable()
+	if not chrome_bin:
+		return {'attempted': False, 'reason': 'chrome_binary_not_found'}
+
+	profile_dir = _chrome_profile_dir_for_port(port)
+	os.makedirs(profile_dir, exist_ok=True)
+
+	launch_args = [
+		chrome_bin,
+		f'--remote-debugging-port={port}',
+		f'--user-data-dir={profile_dir}',
+		'--no-first-run',
+		'--no-default-browser-check',
+	]
+
+	if os.name == 'nt':
+		launch_args.append('--new-window')
+
+	try:
+		process = subprocess.Popen(launch_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+	except Exception as e:
+		return {
+			'attempted': True,
+			'reason': 'chrome_launch_failed',
+			'error': str(e),
+			'chrome_bin': chrome_bin,
+			'profile_dir': profile_dir,
+		}
+
+	for _ in range(24):
+		is_ready, _ = _probe_cdp_sync(cdp_url)
+		if is_ready:
+			return {
+				'attempted': True,
+				'launched': True,
+				'pid': process.pid,
+				'chrome_bin': chrome_bin,
+				'profile_dir': profile_dir,
+			}
+		if process.poll() is not None:
+			return {
+				'attempted': True,
+				'reason': 'chrome_exited_early',
+				'returncode': process.returncode,
+				'chrome_bin': chrome_bin,
+				'profile_dir': profile_dir,
+			}
+		time.sleep(0.25)
+
+	return {
+		'attempted': True,
+		'reason': 'cdp_not_ready_after_launch',
+		'chrome_bin': chrome_bin,
+		'profile_dir': profile_dir,
+	}
 
 
 @dataclass
@@ -908,7 +1026,7 @@ class GeminiBridgeService:
 				status_code=422,
 			)
 
-		session = await self._ensure_session(force_reconnect=force_reconnect, cdp_port=port)
+		session = await self._ensure_session(force_reconnect=force_reconnect, cdp_port=port, allow_auto_launch=True)
 		await session.navigate_to(target_url, new_tab=new_tab)
 		await asyncio.sleep(0.6)
 
@@ -1274,7 +1392,13 @@ class GeminiBridgeService:
 			elapsed_ms=elapsed_ms,
 		)
 
-	async def _ensure_session(self, *, force_reconnect: bool, cdp_port: int | None) -> BrowserSession:
+	async def _ensure_session(
+		self,
+		*,
+		force_reconnect: bool,
+		cdp_port: int | None,
+		allow_auto_launch: bool = False,
+	) -> BrowserSession:
 		port = self._resolve_port(cdp_port)
 		session = self._sessions.get(port)
 		if session is not None and session.is_cdp_connected and not force_reconnect:
@@ -1288,12 +1412,23 @@ class GeminiBridgeService:
 
 		cdp_url = self.cdp_url_for_port(port)
 		is_cdp_ready, cdp_meta = await asyncio.to_thread(_probe_cdp_sync, cdp_url)
+		auto_launch_result: dict[str, Any] | None = None
+		if not is_cdp_ready and allow_auto_launch:
+			if _auto_launch_chrome_enabled():
+				auto_launch_result = await asyncio.to_thread(_launch_local_chrome_cdp_sync, cdp_url, port)
+				is_cdp_ready, cdp_meta = await asyncio.to_thread(_probe_cdp_sync, cdp_url)
+			else:
+				auto_launch_result = {'attempted': False, 'reason': 'auto_launch_disabled'}
+
 		if not is_cdp_ready:
+			details: dict[str, Any] = {'cdp_url': cdp_url, 'cdp_port': port, 'reason': 'cdp_endpoint_unreachable'}
+			if auto_launch_result is not None:
+				details['auto_launch'] = auto_launch_result
 			raise AutomationError(
 				'CDP_CONNECT_FAILED',
 				f'Cannot reach Chrome CDP at {cdp_url}. Start Chrome with --remote-debugging-port={port}.',
 				status_code=503,
-				details={'cdp_url': cdp_url, 'cdp_port': port, 'reason': 'cdp_endpoint_unreachable'},
+				details=details,
 			)
 
 		last_error: Exception | None = None
