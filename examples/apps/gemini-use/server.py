@@ -22,7 +22,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
@@ -61,15 +61,60 @@ def _to_int(value: str | None, default: int) -> int:
 		return default
 
 
+def _parse_port_from_cdp_url(cdp_url: str, default: int = 9222) -> int:
+	parsed = urlparse(cdp_url)
+	if parsed.port is None:
+		return default
+	if parsed.port < 1 or parsed.port > 65535:
+		return default
+	return parsed.port
+
+
+def _build_cdp_url_for_port(base_cdp_url: str, port: int) -> str:
+	parsed = urlparse(base_cdp_url)
+	scheme = parsed.scheme or 'http'
+	hostname = parsed.hostname or '127.0.0.1'
+	path = parsed.path or ''
+	netloc = f'{hostname}:{port}'
+	return urlunparse((scheme, netloc, path, '', '', ''))
+
+
+def _parse_discovery_ports(raw: str | None) -> tuple[int, ...]:
+	if not raw:
+		return ()
+	ports: list[int] = []
+	for part in raw.split(','):
+		candidate = _to_int(part.strip() or None, -1)
+		if 1 <= candidate <= 65535:
+			ports.append(candidate)
+	return tuple(sorted(set(ports)))
+
+
+def _probe_cdp_sync(cdp_url: str) -> tuple[bool, dict[str, Any]]:
+	version_url = f"{cdp_url.rstrip('/')}/json/version"
+	request = Request(version_url, headers={'User-Agent': 'Mozilla/5.0'})
+	try:
+		with urlopen(request, timeout=2.0) as response:
+			payload = json.loads(response.read().decode('utf-8'))
+			if isinstance(payload, dict):
+				return True, payload
+			return True, {}
+	except Exception:
+		return False, {}
+
+
 @dataclass
 class ServiceConfig:
 	provider: ChatProvider
 	display_name: str
 	cdp_url: str
+	default_open_url: str
 	tab_hosts: tuple[str, ...]
 	default_timeout_s: float
 	poll_interval_s: float
 	stable_polls: int
+	cdp_connect_retries: int
+	cdp_connect_retry_delay_s: float
 	mode_required: bool
 	supports_mode: bool
 	max_prompt_len: int
@@ -81,6 +126,7 @@ class ServiceConfig:
 		provider: ChatProvider,
 		display_name: str,
 		default_hosts: str,
+		default_open_url: str,
 		supports_mode: bool,
 	) -> 'ServiceConfig':
 		prefix = provider.upper()
@@ -93,10 +139,13 @@ class ServiceConfig:
 			provider=provider,
 			display_name=display_name,
 			cdp_url=os.getenv('CHAT_BRIDGE_CDP_URL', os.getenv('GEMINI_CDP_URL', 'http://127.0.0.1:9222')).strip(),
+			default_open_url=os.getenv(f'{prefix}_OPEN_URL', default_open_url).strip(),
 			tab_hosts=hosts,
 			default_timeout_s=_to_float(os.getenv(f'{prefix}_DEFAULT_TIMEOUT_S', os.getenv('GEMINI_DEFAULT_TIMEOUT_S')), 240.0),
 			poll_interval_s=_to_float(os.getenv(f'{prefix}_POLL_INTERVAL_S', os.getenv('GEMINI_POLL_INTERVAL_S')), 1.0),
 			stable_polls=max(2, _to_int(os.getenv(f'{prefix}_STABLE_POLLS', os.getenv('GEMINI_STABLE_POLLS')), 3)),
+			cdp_connect_retries=max(1, _to_int(os.getenv(f'{prefix}_CDP_CONNECT_RETRIES', os.getenv('GEMINI_CDP_CONNECT_RETRIES')), 3)),
+			cdp_connect_retry_delay_s=max(0.25, _to_float(os.getenv(f'{prefix}_CDP_CONNECT_RETRY_DELAY_S', os.getenv('GEMINI_CDP_CONNECT_RETRY_DELAY_S')), 1.0)),
 			mode_required=_to_bool(os.getenv(f'{prefix}_MODE_REQUIRED'), default=False),
 			supports_mode=supports_mode,
 			max_prompt_len=max(256, _to_int(os.getenv(f'{prefix}_MAX_PROMPT_LEN', os.getenv('GEMINI_MAX_PROMPT_LEN')), 16000)),
@@ -114,6 +163,7 @@ class AutomationError(Exception):
 
 class ChatRequest(BaseModel):
 	prompt: str = Field(min_length=1, max_length=16000)
+	port: int = Field(ge=1, le=65535)
 	mode: ChatMode | None = None
 	timeout_s: float | None = Field(default=None, ge=10.0, le=600.0)
 
@@ -133,6 +183,7 @@ class ChatResponse(BaseModel):
 
 class ImageRequest(BaseModel):
 	prompt: str = Field(min_length=1, max_length=16000)
+	port: int = Field(ge=1, le=65535)
 	timeout_s: float | None = Field(default=None, ge=20.0, le=600.0)
 	max_images: int = Field(default=4, ge=1, le=4)
 
@@ -156,6 +207,61 @@ class ImageResponse(BaseModel):
 	error_message: str | None = None
 	details: dict[str, Any] | None = None
 	elapsed_ms: int
+
+
+class OpenWebRequest(BaseModel):
+	provider: ChatProvider
+	port: int = Field(ge=1, le=65535)
+	url: str | None = Field(default=None, max_length=2048)
+	new_tab: bool = True
+	force_reconnect: bool = False
+
+
+class OpenWebResponse(BaseModel):
+	success: bool
+	provider: ChatProvider
+	port: int
+	cdp_url: str | None = None
+	navigated_url: str | None = None
+	provider_tab_ready: bool | None = None
+	active_ports: list[int] | None = None
+	error_code: str | None = None
+	error_message: str | None = None
+	details: dict[str, Any] | None = None
+	elapsed_ms: int
+
+
+class PingPortsRequest(BaseModel):
+	ports: list[int] | None = None
+
+
+class PortStatus(BaseModel):
+	port: int
+	active: bool
+	cdp_url: str
+	managed_by: list[ChatProvider] = Field(default_factory=list)
+	browser: str | None = None
+	web_socket_debugger_url: str | None = None
+
+
+class PingPortsResponse(BaseModel):
+	success: bool
+	ports: list[PortStatus]
+
+
+class ClosePortRequest(BaseModel):
+	port: int = Field(ge=1, le=65535)
+	provider: ChatProvider | None = None
+	shutdown_browser: bool = False
+
+
+class ClosePortResponse(BaseModel):
+	success: bool
+	port: int
+	closed_by: list[ChatProvider]
+	error_code: str | None = None
+	error_message: str | None = None
+	details: dict[str, Any] | None = None
 
 
 MODE_TARGETS: dict[str, tuple[str, ...]] = {
@@ -750,29 +856,157 @@ class GeminiBridgeService:
 	def __init__(self, cfg: ServiceConfig, *, request_lock: asyncio.Lock):
 		self.cfg = cfg
 		self.logger = logging.getLogger(f'{cfg.provider}_bridge')
-		self._session: BrowserSession | None = None
+		self._default_port = _parse_port_from_cdp_url(cfg.cdp_url)
+		self._sessions: dict[int, BrowserSession] = {}
 		self._request_lock = request_lock
 		self._startup_lock = asyncio.Lock()
 
 	async def startup(self) -> None:
 		async with self._startup_lock:
-			await self._ensure_session(force_reconnect=True)
+			# Startup should not fail if CDP is not ready yet.
+			try:
+				await self._ensure_session(force_reconnect=False, cdp_port=self._default_port)
+			except AutomationError as e:
+				self.logger.info('startup skipped: %s (%s)', e.code, e.message)
 
 	async def shutdown(self) -> None:
-		if self._session is None:
-			return
+		for port, session in list(self._sessions.items()):
+			try:
+				await session.stop()
+			except Exception as e:
+				self.logger.warning('failed to stop browser session on port %s: %s', port, e)
+			finally:
+				self._sessions.pop(port, None)
+
+	def managed_ports(self) -> list[int]:
+		ports: list[int] = []
+		for port, session in self._sessions.items():
+			if session.is_cdp_connected:
+				ports.append(port)
+		return sorted(set(ports))
+
+	def has_managed_port(self, port: int) -> bool:
+		session = self._sessions.get(port)
+		return bool(session is not None and session.is_cdp_connected)
+
+	def cdp_url_for_port(self, port: int) -> str:
+		return _build_cdp_url_for_port(self.cfg.cdp_url, port)
+
+	async def open_web(
+		self,
+		*,
+		port: int,
+		url: str | None,
+		new_tab: bool,
+		force_reconnect: bool,
+	) -> dict[str, Any]:
+		target_url = (url or self.cfg.default_open_url or '').strip()
+		if not target_url:
+			raise AutomationError(
+				'OPEN_URL_MISSING',
+				f'No target URL provided for {self.cfg.display_name}.',
+				status_code=422,
+			)
+
+		session = await self._ensure_session(force_reconnect=force_reconnect, cdp_port=port)
+		await session.navigate_to(target_url, new_tab=new_tab)
+		await asyncio.sleep(0.6)
+
+		provider_tab_ready = False
+		tab_url = target_url
 		try:
-			await self._session.stop()
+			tab = await self._switch_to_gemini_tab(session)
+			provider_tab_ready = True
+			tab_url = tab.url
+		except AutomationError:
+			provider_tab_ready = False
+
+		return {
+			'provider': self.cfg.provider,
+			'port': port,
+			'cdp_url': self.cdp_url_for_port(port),
+			'navigated_url': tab_url,
+			'provider_tab_ready': provider_tab_ready,
+			'active_ports': self.managed_ports(),
+		}
+
+	async def close_port(self, *, port: int, shutdown_browser: bool) -> bool:
+		session = self._sessions.get(port)
+		if session is None:
+			return False
+
+		if shutdown_browser:
+			try:
+				cdp_session = await session.get_or_create_cdp_session(focus=False)
+				await cdp_session.cdp_client.send.Browser.close()
+			except Exception:
+				pass
+
+		try:
+			await session.stop()
 		except Exception as e:
-			self.logger.warning('failed to stop browser session: %s', e)
+			self.logger.warning('failed to close session on port %s: %s', port, e)
+			raise
 		finally:
-			self._session = None
+			self._sessions.pop(port, None)
+
+		return True
+
+	async def probe_port(self, port: int) -> PortStatus:
+		cdp_url = self.cdp_url_for_port(port)
+		active, payload = await asyncio.to_thread(_probe_cdp_sync, cdp_url)
+		managed = self.has_managed_port(port)
+		return PortStatus(
+			port=port,
+			active=bool(active or managed),
+			cdp_url=cdp_url,
+			managed_by=[self.cfg.provider] if managed else [],
+			browser=str(payload.get('Browser') or '') or None,
+			web_socket_debugger_url=str(payload.get('webSocketDebuggerUrl') or '') or None,
+		)
+
+	def _resolve_port(self, cdp_port: int | None) -> int:
+		if cdp_port is None:
+			return self._default_port
+		if cdp_port < 1 or cdp_port > 65535:
+			raise AutomationError(
+				'INVALID_CDP_PORT',
+				'CDP port must be between 1 and 65535.',
+				status_code=422,
+				details={'port': cdp_port},
+			)
+		return cdp_port
+
+	def _find_port_for_session(self, session: BrowserSession) -> int:
+		for port, candidate in self._sessions.items():
+			if candidate is session:
+				return port
+		return self._default_port
+
+	def _build_browser_session(self, cdp_url: str) -> BrowserSession:
+		# Prefer direct BrowserSession construction so runtime fields are explicit.
+		try:
+			return BrowserSession(
+				cdp_url=cdp_url,
+				is_local=False,
+				keep_alive=True,
+				highlight_elements=False,
+			)
+		except Exception:
+			profile = BrowserProfile(
+				cdp_url=cdp_url,
+				is_local=False,
+				keep_alive=True,
+				highlight_elements=False,
+			)
+			return BrowserSession(browser_profile=profile)
 
 	async def ask(
 		self,
 		*,
 		request_id: str,
 		prompt: str,
+		cdp_port: int | None,
 		mode: ChatMode | None,
 		timeout_s: float | None,
 	) -> ChatResponse:
@@ -787,97 +1021,107 @@ class GeminiBridgeService:
 			)
 
 		effective_timeout = timeout_s if timeout_s is not None else self.cfg.default_timeout_s
+		request_deadline = started + effective_timeout
 		mode_applied: bool | None = None
 
-		async with self._request_lock:
-			session = await self._ensure_session(force_reconnect=False)
-			tab = await self._switch_to_gemini_tab(session)
+		try:
+			async with asyncio.timeout(effective_timeout):
+				async with self._request_lock:
+					session = await self._ensure_session(force_reconnect=False, cdp_port=cdp_port)
+					tab = await self._switch_to_gemini_tab(session)
 
-			if mode is not None and self.cfg.supports_mode:
-				mode_applied = await self._apply_mode(session, mode)
-				if self.cfg.mode_required and not mode_applied:
-					raise AutomationError(
-						'MODE_SWITCH_FAILED',
-						f'Unable to switch {self.cfg.display_name} mode to {mode}.',
-						status_code=409,
-						details={'mode': mode, 'tab_url': tab.url},
+					if mode is not None and self.cfg.supports_mode:
+						mode_applied = await self._apply_mode(session, mode)
+						if self.cfg.mode_required and not mode_applied:
+							raise AutomationError(
+								'MODE_SWITCH_FAILED',
+								f'Unable to switch {self.cfg.display_name} mode to {mode}.',
+								status_code=409,
+								details={'mode': mode, 'tab_url': tab.url},
+							)
+					elif mode not in (None, 'fast'):
+						raise AutomationError(
+							'MODE_UNSUPPORTED',
+							f'{self.cfg.display_name} mode {mode} is not implemented by this bridge yet.',
+							status_code=422,
+							details={'provider': self.cfg.provider, 'mode': mode},
+						)
+					elif mode is not None:
+						mode_applied = False
+
+					new_chat_result = await self._run_js(session, CLICK_NEW_CHAT_JS)
+					if isinstance(new_chat_result, dict) and new_chat_result.get('ok'):
+						await asyncio.sleep(0.8)
+
+					baseline = await self._snapshot(session)
+					if not baseline.get('composerFound'):
+						raise AutomationError(
+							'COMPOSER_NOT_FOUND',
+							f'{self.cfg.display_name} input box is not available. Open the chat UI and ensure the page is fully loaded.',
+							status_code=409,
+							details={'tab_url': tab.url},
+						)
+
+					send_result = await self._run_js(session, build_send_prompt_js(prompt))
+					if not isinstance(send_result, dict) or not send_result.get('ok'):
+						raise AutomationError(
+							'PROMPT_SEND_FAILED',
+							'Failed to write prompt into Gemini composer.',
+							status_code=502,
+							details={'send_result': send_result},
+						)
+
+					typed_prompt = str(send_result.get('composerText') or '').strip()
+					if typed_prompt != prompt.strip():
+						post_type = await self._snapshot(session)
+						typed_prompt = str(post_type.get('composerText') or '').strip()
+						if typed_prompt != prompt.strip():
+							raise AutomationError(
+								'PROMPT_WRITE_NOT_CONFIRMED',
+								'Prompt did not persist in Gemini composer after input attempt.',
+								status_code=502,
+								details={'send_result': send_result, 'post_type': post_type},
+							)
+
+					submit_result = await self._run_js(session, CLICK_SEND_BUTTON_JS)
+					if not isinstance(submit_result, dict) or not submit_result.get('ok'):
+						raise AutomationError(
+							'PROMPT_SUBMIT_FAILED',
+							'Failed to trigger Gemini prompt submission.',
+							status_code=502,
+							details={'submit_result': submit_result},
+						)
+
+					await asyncio.sleep(0.5)
+					post_send = await self._snapshot(session)
+					post_send_text = str(post_send.get('composerText') or '').strip()
+					if (
+						post_send_text == prompt.strip()
+						and not bool(post_send.get('isStreaming'))
+						and int(post_send.get('responseCount') or 0) <= int(baseline.get('responseCount') or 0)
+					):
+						retry_send = await self._run_js(session, CLICK_SEND_BUTTON_JS)
+						if not isinstance(retry_send, dict) or not retry_send.get('ok'):
+							raise AutomationError(
+								'PROMPT_SUBMIT_NOT_CONFIRMED',
+								'Prompt remained in Gemini composer after submission attempt.',
+								status_code=502,
+								details={'send_result': send_result, 'retry_send': retry_send, 'post_send': post_send},
+							)
+
+					answer = await self._wait_for_answer(
+						session=session,
+						baseline_count=int(baseline.get('responseCount') or 0),
+						baseline_last=str(baseline.get('lastResponseText') or ''),
+						timeout_s=self._remaining_timeout_or_raise(request_deadline=request_deadline, stage='waiting for final response'),
 					)
-			elif mode not in (None, 'fast'):
-				raise AutomationError(
-					'MODE_UNSUPPORTED',
-					f'{self.cfg.display_name} mode {mode} is not implemented by this bridge yet.',
-					status_code=422,
-					details={'provider': self.cfg.provider, 'mode': mode},
-				)
-			elif mode is not None:
-				mode_applied = False
-
-			new_chat_result = await self._run_js(session, CLICK_NEW_CHAT_JS)
-			if isinstance(new_chat_result, dict) and new_chat_result.get('ok'):
-				await asyncio.sleep(0.8)
-
-			baseline = await self._snapshot(session)
-			if not baseline.get('composerFound'):
-				raise AutomationError(
-					'COMPOSER_NOT_FOUND',
-					f'{self.cfg.display_name} input box is not available. Open the chat UI and ensure the page is fully loaded.',
-					status_code=409,
-					details={'tab_url': tab.url},
-				)
-
-			send_result = await self._run_js(session, build_send_prompt_js(prompt))
-			if not isinstance(send_result, dict) or not send_result.get('ok'):
-				raise AutomationError(
-					'PROMPT_SEND_FAILED',
-					'Failed to write prompt into Gemini composer.',
-					status_code=502,
-					details={'send_result': send_result},
-				)
-
-			typed_prompt = str(send_result.get('composerText') or '').strip()
-			if typed_prompt != prompt.strip():
-				post_type = await self._snapshot(session)
-				typed_prompt = str(post_type.get('composerText') or '').strip()
-				if typed_prompt != prompt.strip():
-					raise AutomationError(
-						'PROMPT_WRITE_NOT_CONFIRMED',
-						'Prompt did not persist in Gemini composer after input attempt.',
-						status_code=502,
-						details={'send_result': send_result, 'post_type': post_type},
-					)
-
-			submit_result = await self._run_js(session, CLICK_SEND_BUTTON_JS)
-			if not isinstance(submit_result, dict) or not submit_result.get('ok'):
-				raise AutomationError(
-					'PROMPT_SUBMIT_FAILED',
-					'Failed to trigger Gemini prompt submission.',
-					status_code=502,
-					details={'submit_result': submit_result},
-				)
-
-			await asyncio.sleep(0.5)
-			post_send = await self._snapshot(session)
-			post_send_text = str(post_send.get('composerText') or '').strip()
-			if (
-				post_send_text == prompt.strip()
-				and not bool(post_send.get('isStreaming'))
-				and int(post_send.get('responseCount') or 0) <= int(baseline.get('responseCount') or 0)
-			):
-				retry_send = await self._run_js(session, CLICK_SEND_BUTTON_JS)
-				if not isinstance(retry_send, dict) or not retry_send.get('ok'):
-					raise AutomationError(
-						'PROMPT_SUBMIT_NOT_CONFIRMED',
-						'Prompt remained in Gemini composer after submission attempt.',
-						status_code=502,
-						details={'send_result': send_result, 'retry_send': retry_send, 'post_send': post_send},
-					)
-
-			answer = await self._wait_for_answer(
-				session=session,
-				baseline_count=int(baseline.get('responseCount') or 0),
-				baseline_last=str(baseline.get('lastResponseText') or ''),
-				timeout_s=effective_timeout,
-			)
+		except TimeoutError as e:
+			raise AutomationError(
+				f'{self.cfg.provider.upper()}_REQUEST_TIMEOUT',
+				f'{self.cfg.display_name} request exceeded timeout.',
+				status_code=504,
+				details={'timeout_s': effective_timeout},
+			) from e
 
 		elapsed_ms = int((time.time() - started) * 1000)
 		return ChatResponse(
@@ -895,6 +1139,7 @@ class GeminiBridgeService:
 		*,
 		request_id: str,
 		prompt: str,
+		cdp_port: int | None,
 		timeout_s: float | None,
 		max_images: int,
 	) -> ImageResponse:
@@ -909,106 +1154,116 @@ class GeminiBridgeService:
 			)
 
 		effective_timeout = timeout_s if timeout_s is not None else max(self.cfg.default_timeout_s, 240.0)
+		request_deadline = started + effective_timeout
 
-		async with self._request_lock:
-			session = await self._ensure_session(force_reconnect=False)
-			tab = await self._switch_to_gemini_tab(session)
+		try:
+			async with asyncio.timeout(effective_timeout):
+				async with self._request_lock:
+					session = await self._ensure_session(force_reconnect=False, cdp_port=cdp_port)
+					tab = await self._switch_to_gemini_tab(session)
 
-			new_chat_result = await self._run_js(session, CLICK_NEW_CHAT_JS)
-			if isinstance(new_chat_result, dict) and new_chat_result.get('ok'):
-				await asyncio.sleep(0.8)
+					new_chat_result = await self._run_js(session, CLICK_NEW_CHAT_JS)
+					if isinstance(new_chat_result, dict) and new_chat_result.get('ok'):
+						await asyncio.sleep(0.8)
 
-			tool_result = await self._run_js(session, CLICK_CREATE_IMAGE_TOOL_JS)
-			if isinstance(tool_result, dict) and tool_result.get('ok'):
-				await asyncio.sleep(0.5)
+					tool_result = await self._run_js(session, CLICK_CREATE_IMAGE_TOOL_JS)
+					if isinstance(tool_result, dict) and tool_result.get('ok'):
+						await asyncio.sleep(0.5)
 
-			baseline = await self._snapshot_images(session)
-			text_baseline = await self._snapshot(session)
-			if not text_baseline.get('composerFound'):
-				raise AutomationError(
-					'COMPOSER_NOT_FOUND',
-					f'{self.cfg.display_name} input box is not available. Open the chat UI and ensure the page is fully loaded.',
-					status_code=409,
-					details={'tab_url': tab.url},
-				)
+					baseline = await self._snapshot_images(session)
+					text_baseline = await self._snapshot(session)
+					if not text_baseline.get('composerFound'):
+						raise AutomationError(
+							'COMPOSER_NOT_FOUND',
+							f'{self.cfg.display_name} input box is not available. Open the chat UI and ensure the page is fully loaded.',
+							status_code=409,
+							details={'tab_url': tab.url},
+						)
 
-			send_result = await self._run_js(session, build_send_prompt_js(prompt))
-			if not isinstance(send_result, dict) or not send_result.get('ok'):
-				raise AutomationError(
-					'IMAGE_PROMPT_WRITE_FAILED',
-					f'Failed to write image prompt into {self.cfg.display_name} composer.',
-					status_code=502,
-					details={'send_result': send_result},
-				)
+					send_result = await self._run_js(session, build_send_prompt_js(prompt))
+					if not isinstance(send_result, dict) or not send_result.get('ok'):
+						raise AutomationError(
+							'IMAGE_PROMPT_WRITE_FAILED',
+							f'Failed to write image prompt into {self.cfg.display_name} composer.',
+							status_code=502,
+							details={'send_result': send_result},
+						)
 
-			typed_prompt = str(send_result.get('composerText') or '').strip()
-			if typed_prompt != prompt.strip():
-				post_type = await self._snapshot(session)
-				typed_prompt = str(post_type.get('composerText') or '').strip()
-				if typed_prompt != prompt.strip():
-					raise AutomationError(
-						'IMAGE_PROMPT_WRITE_NOT_CONFIRMED',
-						'Image prompt did not persist in composer after input attempt.',
-						status_code=502,
-						details={'send_result': send_result, 'post_type': post_type},
+					typed_prompt = str(send_result.get('composerText') or '').strip()
+					if typed_prompt != prompt.strip():
+						post_type = await self._snapshot(session)
+						typed_prompt = str(post_type.get('composerText') or '').strip()
+						if typed_prompt != prompt.strip():
+							raise AutomationError(
+								'IMAGE_PROMPT_WRITE_NOT_CONFIRMED',
+								'Image prompt did not persist in composer after input attempt.',
+								status_code=502,
+								details={'send_result': send_result, 'post_type': post_type},
+							)
+
+					submit_result = await self._run_js(session, CLICK_SEND_BUTTON_JS)
+					if not isinstance(submit_result, dict) or not submit_result.get('ok'):
+						raise AutomationError(
+							'IMAGE_PROMPT_SUBMIT_FAILED',
+							f'Failed to submit image prompt to {self.cfg.display_name}.',
+							status_code=502,
+							details={'submit_result': submit_result},
+						)
+
+					await asyncio.sleep(1.0)
+					post_send = await self._snapshot(session)
+					if (
+						str(post_send.get('composerText') or '').strip() == prompt.strip()
+						and not bool(post_send.get('isStreaming'))
+					):
+						retry_send = await self._run_js(session, CLICK_SEND_BUTTON_JS)
+						if not isinstance(retry_send, dict) or not retry_send.get('ok'):
+							raise AutomationError(
+								'IMAGE_PROMPT_SUBMIT_NOT_CONFIRMED',
+								'Image prompt remained in composer after submission attempt.',
+								status_code=502,
+								details={'submit_result': submit_result, 'retry_send': retry_send, 'post_send': post_send},
+							)
+
+					candidates = await self._wait_for_images(
+						session=session,
+						baseline_count=int(baseline.get('imageCount') or 0),
+						baseline_candidates=list(baseline.get('imageCandidates') or []),
+						desired_count=max_images,
+						timeout_s=self._remaining_timeout_or_raise(request_deadline=request_deadline, stage='waiting for generated images'),
 					)
 
-			submit_result = await self._run_js(session, CLICK_SEND_BUTTON_JS)
-			if not isinstance(submit_result, dict) or not submit_result.get('ok'):
-				raise AutomationError(
-					'IMAGE_PROMPT_SUBMIT_FAILED',
-					f'Failed to submit image prompt to {self.cfg.display_name}.',
-					status_code=502,
-					details={'submit_result': submit_result},
-				)
+					images: list[GeneratedImage] = []
+					seen_image_keys: set[str] = set()
+					for idx, candidate in enumerate(candidates[:max_images]):
+						extracted = await self._run_js(session, build_extract_image_js(candidate))
+						if not isinstance(extracted, dict) or not extracted.get('ok'):
+							continue
+						image = await self._persist_generated_image(
+							request_id=request_id,
+							index=idx,
+							payload=extracted,
+						)
+						image_key = f'{image.source_url or image.file_name}|{image.width or 0}|{image.height or 0}'
+						if image_key in seen_image_keys:
+							continue
+						seen_image_keys.add(image_key)
+						images.append(image)
 
-			await asyncio.sleep(1.0)
-			post_send = await self._snapshot(session)
-			if (
-				str(post_send.get('composerText') or '').strip() == prompt.strip()
-				and not bool(post_send.get('isStreaming'))
-			):
-				retry_send = await self._run_js(session, CLICK_SEND_BUTTON_JS)
-				if not isinstance(retry_send, dict) or not retry_send.get('ok'):
-					raise AutomationError(
-						'IMAGE_PROMPT_SUBMIT_NOT_CONFIRMED',
-						'Image prompt remained in composer after submission attempt.',
-						status_code=502,
-						details={'submit_result': submit_result, 'retry_send': retry_send, 'post_send': post_send},
-					)
-
-			candidates = await self._wait_for_images(
-				session=session,
-				baseline_count=int(baseline.get('imageCount') or 0),
-				baseline_candidates=list(baseline.get('imageCandidates') or []),
-				desired_count=max_images,
-				timeout_s=effective_timeout,
-			)
-
-			images: list[GeneratedImage] = []
-			seen_image_keys: set[str] = set()
-			for idx, candidate in enumerate(candidates[:max_images]):
-				extracted = await self._run_js(session, build_extract_image_js(candidate))
-				if not isinstance(extracted, dict) or not extracted.get('ok'):
-					continue
-				image = await self._persist_generated_image(
-					request_id=request_id,
-					index=idx,
-					payload=extracted,
-				)
-				image_key = f'{image.source_url or image.file_name}|{image.width or 0}|{image.height or 0}'
-				if image_key in seen_image_keys:
-					continue
-				seen_image_keys.add(image_key)
-				images.append(image)
-
-			if not images:
-				raise AutomationError(
-					'IMAGE_DOWNLOAD_FAILED',
-					f'{self.cfg.display_name} produced an image candidate but the bridge could not fetch the original asset.',
-					status_code=502,
-					details={'candidate_count': len(candidates)},
-				)
+					if not images:
+						raise AutomationError(
+							'IMAGE_DOWNLOAD_FAILED',
+							f'{self.cfg.display_name} produced an image candidate but the bridge could not fetch the original asset.',
+							status_code=502,
+							details={'candidate_count': len(candidates)},
+						)
+		except TimeoutError as e:
+			raise AutomationError(
+				f'{self.cfg.provider.upper()}_REQUEST_TIMEOUT',
+				f'{self.cfg.display_name} image request exceeded timeout.',
+				status_code=504,
+				details={'timeout_s': effective_timeout},
+			) from e
 
 		elapsed_ms = int((time.time() - started) * 1000)
 		return ImageResponse(
@@ -1019,36 +1274,58 @@ class GeminiBridgeService:
 			elapsed_ms=elapsed_ms,
 		)
 
-	async def _ensure_session(self, *, force_reconnect: bool) -> BrowserSession:
-		if self._session is not None and self._session.is_cdp_connected and not force_reconnect:
-			return self._session
+	async def _ensure_session(self, *, force_reconnect: bool, cdp_port: int | None) -> BrowserSession:
+		port = self._resolve_port(cdp_port)
+		session = self._sessions.get(port)
+		if session is not None and session.is_cdp_connected and not force_reconnect:
+			return session
 
-		if self._session is not None:
+		if session is not None:
 			try:
-				await self._session.stop()
+				await session.stop()
 			except Exception:
 				pass
 
-		profile = BrowserProfile(
-			cdp_url=self.cfg.cdp_url,
-			is_local=False,
-			keep_alive=True,
-			highlight_elements=False,
-		)
-		session = BrowserSession(browser_profile=profile)
-
-		try:
-			await session.start()
-		except Exception as e:
+		cdp_url = self.cdp_url_for_port(port)
+		is_cdp_ready, cdp_meta = await asyncio.to_thread(_probe_cdp_sync, cdp_url)
+		if not is_cdp_ready:
 			raise AutomationError(
 				'CDP_CONNECT_FAILED',
-				f'Cannot connect to Chrome CDP at {self.cfg.cdp_url}. Start Chrome with --remote-debugging-port.',
+				f'Cannot reach Chrome CDP at {cdp_url}. Start Chrome with --remote-debugging-port={port}.',
 				status_code=503,
-				details={'cdp_url': self.cfg.cdp_url, 'reason': str(e)},
-			) from e
+				details={'cdp_url': cdp_url, 'cdp_port': port, 'reason': 'cdp_endpoint_unreachable'},
+			)
 
-		self._session = session
-		return session
+		last_error: Exception | None = None
+		for attempt in range(self.cfg.cdp_connect_retries):
+			session = self._build_browser_session(cdp_url)
+			try:
+				await session.start()
+				self._sessions[port] = session
+				return session
+			except Exception as e:
+				last_error = e
+				try:
+					await session.stop()
+				except Exception:
+					pass
+				if attempt + 1 < self.cfg.cdp_connect_retries:
+					await asyncio.sleep(self.cfg.cdp_connect_retry_delay_s)
+
+		reason = str(last_error) if last_error is not None else 'unknown error'
+		raise AutomationError(
+			'CDP_CONNECT_FAILED',
+			f'Cannot connect to Chrome CDP at {cdp_url}. Start Chrome with --remote-debugging-port={port}.',
+			status_code=503,
+			details={
+				'cdp_url': cdp_url,
+				'cdp_port': port,
+				'reason': reason,
+				'ws': cdp_meta.get('webSocketDebuggerUrl'),
+				'browser': cdp_meta.get('Browser'),
+				'attempts': self.cfg.cdp_connect_retries,
+			},
+		)
 
 	async def _switch_to_gemini_tab(self, session: BrowserSession):
 		tabs = await session.get_tabs()
@@ -1112,6 +1389,17 @@ class GeminiBridgeService:
 			raise AutomationError('IMAGE_SNAPSHOT_INVALID', f'Failed to read {self.cfg.display_name} image page state.', status_code=502)
 		return payload
 
+	def _remaining_timeout_or_raise(self, *, request_deadline: float, stage: str) -> float:
+		remaining = request_deadline - time.time()
+		if remaining <= 0:
+			raise AutomationError(
+				f'{self.cfg.provider.upper()}_REQUEST_TIMEOUT',
+				f'Timed out while {stage}.',
+				status_code=504,
+				details={'stage': stage, 'remaining_s': round(remaining, 3)},
+			)
+		return max(1.0, remaining)
+
 	async def _wait_for_answer(
 		self,
 		*,
@@ -1122,6 +1410,7 @@ class GeminiBridgeService:
 	) -> str:
 		started = time.time()
 		deadline = started + timeout_s
+		hard_deadline = deadline + STREAM_SETTLE_GRACE_SECONDS
 		stable_count = 0
 		last_seen_signature = ''
 		saw_new_response = False
@@ -1134,8 +1423,11 @@ class GeminiBridgeService:
 
 		while True:
 			now = time.time()
+			if now > hard_deadline:
+				break
 			if now > deadline:
-				if not (saw_streaming and last_streaming_at > 0 and now <= last_streaming_at + STREAM_SETTLE_GRACE_SECONDS):
+				streaming_grace_until = min(last_streaming_at + STREAM_SETTLE_GRACE_SECONDS, hard_deadline)
+				if not (saw_streaming and last_streaming_at > 0 and now <= streaming_grace_until):
 					break
 			try:
 				snapshot = await self._snapshot(session)
@@ -1208,6 +1500,7 @@ class GeminiBridgeService:
 			status_code=504,
 			details={
 				'timeout_s': timeout_s,
+				'hard_timeout_s': timeout_s + STREAM_SETTLE_GRACE_SECONDS,
 				'baseline_count': baseline_count,
 				'baseline_last_len': len(baseline_last),
 				'saw_new_response': saw_new_response,
@@ -1226,6 +1519,7 @@ class GeminiBridgeService:
 	) -> list[dict[str, Any]]:
 		started = time.time()
 		deadline = started + timeout_s
+		hard_deadline = deadline + STREAM_SETTLE_GRACE_SECONDS
 		stable_count = 0
 		last_signature = ''
 		transient_eval_timeouts = 0
@@ -1236,8 +1530,11 @@ class GeminiBridgeService:
 
 		while True:
 			now = time.time()
+			if now > hard_deadline:
+				break
 			if now > deadline:
-				if not (saw_streaming and last_streaming_at > 0 and now <= last_streaming_at + STREAM_SETTLE_GRACE_SECONDS):
+				streaming_grace_until = min(last_streaming_at + STREAM_SETTLE_GRACE_SECONDS, hard_deadline)
+				if not (saw_streaming and last_streaming_at > 0 and now <= streaming_grace_until):
 					break
 			try:
 				snapshot = await self._snapshot_images(session)
@@ -1296,6 +1593,7 @@ class GeminiBridgeService:
 			status_code=504,
 			details={
 				'timeout_s': timeout_s,
+				'hard_timeout_s': timeout_s + STREAM_SETTLE_GRACE_SECONDS,
 				'baseline_count': baseline_count,
 				'last_candidate_count': len(last_candidates),
 				'transient_eval_timeouts': transient_eval_timeouts,
@@ -1375,7 +1673,8 @@ class GeminiBridgeService:
 			return response.read()
 
 	async def _run_js(self, session: BrowserSession, expression: str) -> Any:
-		active_session = self._session if self._session is not None else session
+		active_session = session
+		port = self._find_port_for_session(session)
 		last_error: Exception | None = None
 
 		for attempt in range(2):
@@ -1404,7 +1703,7 @@ class GeminiBridgeService:
 			except Exception as e:
 				last_error = e
 				if attempt == 0:
-					active_session = await self._ensure_session(force_reconnect=True)
+					active_session = await self._ensure_session(force_reconnect=True, cdp_port=port)
 					await self._switch_to_gemini_tab(active_session)
 					continue
 
@@ -1432,14 +1731,18 @@ GEMINI_CFG = ServiceConfig.from_env(
 	provider='gemini',
 	display_name='Gemini',
 	default_hosts='gemini.google.com',
+	default_open_url='https://gemini.google.com/app',
 	supports_mode=True,
 )
 GPT_CFG = ServiceConfig.from_env(
 	provider='gpt',
 	display_name='ChatGPT',
 	default_hosts='chatgpt.com,chat.openai.com',
+	default_open_url='https://chatgpt.com/',
 	supports_mode=False,
 )
+
+DISCOVERY_PORTS = _parse_discovery_ports(os.getenv('CHAT_BRIDGE_DISCOVERY_PORTS', '9222'))
 
 GEMINI_SERVICE = GeminiBridgeService(GEMINI_CFG, request_lock=SHARED_REQUEST_LOCK)
 GPT_SERVICE = GeminiBridgeService(GPT_CFG, request_lock=SHARED_REQUEST_LOCK)
@@ -1447,6 +1750,34 @@ GPT_SERVICE = GeminiBridgeService(GPT_CFG, request_lock=SHARED_REQUEST_LOCK)
 
 def _get_service(provider: ChatProvider) -> GeminiBridgeService:
 	return GPT_SERVICE if provider == 'gpt' else GEMINI_SERVICE
+
+
+def _all_services() -> dict[ChatProvider, GeminiBridgeService]:
+	return {'gemini': GEMINI_SERVICE, 'gpt': GPT_SERVICE}
+
+
+def _collect_candidate_ports(requested_ports: list[int] | None) -> list[int]:
+	ports: set[int] = set(DISCOVERY_PORTS)
+	for service in _all_services().values():
+		ports.update(service.managed_ports())
+	for port in requested_ports or []:
+		if 1 <= port <= 65535:
+			ports.add(port)
+	return sorted(ports)
+
+
+async def _build_port_statuses(ports: list[int]) -> list[PortStatus]:
+	statuses: list[PortStatus] = []
+	services = _all_services()
+	for port in ports:
+		base_status = await GEMINI_SERVICE.probe_port(port)
+		managed_by: list[ChatProvider] = []
+		for provider, service in services.items():
+			if service.has_managed_port(port):
+				managed_by.append(provider)
+		status = base_status.model_copy(update={'managed_by': managed_by, 'active': bool(base_status.active or managed_by)})
+		statuses.append(status)
+	return statuses
 
 
 @asynccontextmanager
@@ -1478,6 +1809,7 @@ async def _dispatch_chat(provider: ChatProvider, payload: ChatRequest):
 		response = await service.ask(
 			request_id=request_id,
 			prompt=payload.prompt,
+			cdp_port=payload.port,
 			mode=payload.mode,
 			timeout_s=payload.timeout_s,
 		)
@@ -1522,6 +1854,7 @@ async def _dispatch_image(provider: ChatProvider, payload: ImageRequest):
 		response = await service.create_image(
 			request_id=request_id,
 			prompt=payload.prompt,
+			cdp_port=payload.port,
 			timeout_s=payload.timeout_s,
 			max_images=payload.max_images,
 		)
@@ -1552,6 +1885,105 @@ async def _dispatch_image(provider: ChatProvider, payload: ImageRequest):
 			elapsed_ms=elapsed_ms,
 		)
 		return JSONResponse(status_code=500, content=body.model_dump(mode='json'))
+
+
+@app.post('/v1/web/open', response_model=OpenWebResponse)
+async def open_web(payload: OpenWebRequest):
+	service = _get_service(payload.provider)
+	started = time.time()
+
+	try:
+		result = await service.open_web(
+			port=payload.port,
+			url=payload.url,
+			new_tab=payload.new_tab,
+			force_reconnect=payload.force_reconnect,
+		)
+		statuses = await _build_port_statuses(_collect_candidate_ports([payload.port]))
+		active_ports = [item.port for item in statuses if item.active]
+		elapsed_ms = int((time.time() - started) * 1000)
+		return OpenWebResponse(
+			success=True,
+			provider=payload.provider,
+			port=payload.port,
+			cdp_url=str(result.get('cdp_url') or ''),
+			navigated_url=str(result.get('navigated_url') or ''),
+			provider_tab_ready=bool(result.get('provider_tab_ready')),
+			active_ports=active_ports,
+			elapsed_ms=elapsed_ms,
+		)
+	except AutomationError as e:
+		elapsed_ms = int((time.time() - started) * 1000)
+		body = OpenWebResponse(
+			success=False,
+			provider=payload.provider,
+			port=payload.port,
+			cdp_url=service.cdp_url_for_port(payload.port),
+			navigated_url=None,
+			provider_tab_ready=False,
+			active_ports=[],
+			error_code=e.code,
+			error_message=e.message,
+			details=e.details,
+			elapsed_ms=elapsed_ms,
+		)
+		return JSONResponse(status_code=e.status_code, content=body.model_dump(mode='json'))
+	except Exception as e:
+		elapsed_ms = int((time.time() - started) * 1000)
+		body = OpenWebResponse(
+			success=False,
+			provider=payload.provider,
+			port=payload.port,
+			cdp_url=service.cdp_url_for_port(payload.port),
+			navigated_url=None,
+			provider_tab_ready=False,
+			active_ports=[],
+			error_code='UNHANDLED_ERROR',
+			error_message='Unhandled server error.',
+			details={'reason': str(e)},
+			elapsed_ms=elapsed_ms,
+		)
+		return JSONResponse(status_code=500, content=body.model_dump(mode='json'))
+
+
+@app.post('/v1/ports/ping', response_model=PingPortsResponse)
+async def ping_ports(payload: PingPortsRequest):
+	ports = _collect_candidate_ports(payload.ports)
+	statuses = await _build_port_statuses(ports)
+	return PingPortsResponse(success=True, ports=statuses)
+
+
+@app.get('/v1/ports/ping', response_model=PingPortsResponse)
+async def ping_ports_default():
+	ports = _collect_candidate_ports(None)
+	statuses = await _build_port_statuses(ports)
+	return PingPortsResponse(success=True, ports=statuses)
+
+
+@app.post('/v1/ports/close', response_model=ClosePortResponse)
+async def close_port(payload: ClosePortRequest):
+	providers: list[ChatProvider] = [payload.provider] if payload.provider is not None else ['gemini', 'gpt']
+	closed_by: list[ChatProvider] = []
+
+	for provider in providers:
+		service = _get_service(provider)
+		if await service.close_port(port=payload.port, shutdown_browser=payload.shutdown_browser):
+			closed_by.append(provider)
+
+	if not closed_by:
+		body = ClosePortResponse(
+			success=False,
+			port=payload.port,
+			closed_by=[],
+			error_code='PORT_NOT_ACTIVE',
+			error_message='No managed session found on the requested port.',
+			details={'provider': payload.provider},
+		)
+		return JSONResponse(status_code=404, content=body.model_dump(mode='json'))
+
+	return ClosePortResponse(success=True, port=payload.port, closed_by=closed_by)
+
+
 @app.post('/v1/chat/gemini', response_model=ChatResponse)
 async def chat_gemini(payload: ChatRequest):
 	return await _dispatch_chat('gemini', payload)

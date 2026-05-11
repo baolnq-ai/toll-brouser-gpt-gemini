@@ -10,12 +10,15 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 cd "$ROOT_DIR"
 
 SETUP_ONLY=0
+ASSUME_YES=0
+OS_FAMILY="unknown"
 
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+usage() {
 	cat <<'EOF'
 Usage:
 	./setup.sh            Setup dependencies and start the Gemini/GPT FastAPI bridge
-  ./setup.sh --setup-only
+	./setup.sh --setup-only
+	./setup.sh --yes
 
 Environment variables:
 	GEMINI_CDP_URL            Default: http://127.0.0.1:9222
@@ -23,18 +26,248 @@ Environment variables:
 	GEMINI_API_PORT           Default: 8008
 	GEMINI_API_LOG_LEVEL      Default: info
 	Ports auto-jump to a free value when possible to avoid conflicts
-  AUTO_LAUNCH_CHROME        Default: 0 (set to 1 to auto launch Chrome with debug port)
-  CHROME_BIN                Optional explicit Chrome binary path
+	AUTO_LAUNCH_CHROME        Default: 0 (set to 1 to auto launch Chrome with debug port)
+	STRICT_CDP_STARTUP        Default: 0 (set to 1 to fail setup when CDP is unavailable)
+	CHROME_BIN                Optional explicit Chrome binary path
 EOF
-	exit 0
-fi
+}
 
-if [[ "${1:-}" == "--setup-only" ]]; then
-	SETUP_ONLY=1
-fi
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--help|-h)
+			usage
+			exit 0
+			;;
+		--setup-only)
+			SETUP_ONLY=1
+			;;
+		--yes|-y)
+			ASSUME_YES=1
+			;;
+		*)
+			echo "[setup] ERROR: unknown option: $1" >&2
+			usage
+			exit 1
+			;;
+	esac
+	shift
+done
 
 log() {
 	echo "[setup] $*"
+}
+
+detect_os() {
+	case "$(uname -s)" in
+		Linux*)
+			OS_FAMILY="linux"
+			;;
+		Darwin*)
+			OS_FAMILY="macos"
+			;;
+		MINGW*|MSYS*|CYGWIN*)
+			OS_FAMILY="windows"
+			;;
+		*)
+			OS_FAMILY="unknown"
+			;;
+	esac
+}
+
+ask_yes_no() {
+	local prompt="$1"
+	if [[ "$ASSUME_YES" == "1" ]]; then
+		log "$prompt -> yes (auto)"
+		return 0
+	fi
+
+	local answer
+	read -r -p "$prompt [y/N] " answer
+	case "${answer,,}" in
+		y|yes)
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+run_with_sudo() {
+	if [[ "$(id -u)" == "0" ]]; then
+		"$@"
+		return
+	fi
+
+	if command -v sudo >/dev/null 2>&1; then
+		sudo "$@"
+		return
+	fi
+
+	echo "[setup] ERROR: need root privileges to run: $*" >&2
+	exit 1
+}
+
+is_python_compatible() {
+	local cmd="$1"
+	"$cmd" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
+PY
+}
+
+find_python_cmd() {
+	local candidate
+	for candidate in python3.12 python3.11 python3 python; do
+		if command -v "$candidate" >/dev/null 2>&1 && is_python_compatible "$candidate"; then
+			echo "$candidate"
+			return 0
+		fi
+	done
+	return 1
+}
+
+ensure_brew() {
+	if command -v brew >/dev/null 2>&1; then
+		return
+	fi
+
+	if ! ask_yes_no "Homebrew is required but not installed. Install Homebrew now?"; then
+		echo "[setup] ERROR: Homebrew is required to continue on macOS" >&2
+		exit 1
+	fi
+
+	/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+	if [[ -x /opt/homebrew/bin/brew ]]; then
+		eval "$(/opt/homebrew/bin/brew shellenv)"
+	elif [[ -x /usr/local/bin/brew ]]; then
+		eval "$(/usr/local/bin/brew shellenv)"
+	fi
+
+	if ! command -v brew >/dev/null 2>&1; then
+		echo "[setup] ERROR: Homebrew installation did not complete" >&2
+		exit 1
+	fi
+}
+
+install_python_for_os() {
+	case "$OS_FAMILY" in
+		windows)
+			if command -v winget >/dev/null 2>&1; then
+				powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "winget install -e --id Python.Python.3.11 --accept-package-agreements --accept-source-agreements"
+			elif command -v choco >/dev/null 2>&1; then
+				choco install -y python --version=3.11.9
+			else
+				echo "[setup] ERROR: no supported package manager found on Windows (winget/choco)" >&2
+				exit 1
+			fi
+			;;
+		macos)
+			ensure_brew
+			brew install python@3.11
+			;;
+		linux)
+			if command -v apt-get >/dev/null 2>&1; then
+				run_with_sudo apt-get update
+				run_with_sudo apt-get install -y python3 python3-venv python3-pip
+			elif command -v dnf >/dev/null 2>&1; then
+				run_with_sudo dnf install -y python3 python3-pip
+			elif command -v yum >/dev/null 2>&1; then
+				run_with_sudo yum install -y python3 python3-pip
+			elif command -v pacman >/dev/null 2>&1; then
+				run_with_sudo pacman -Sy --noconfirm python python-pip
+			else
+				echo "[setup] ERROR: no supported Linux package manager found (apt/dnf/yum/pacman)" >&2
+				exit 1
+			fi
+			;;
+		*)
+			echo "[setup] ERROR: unsupported OS for automatic Python installation" >&2
+			exit 1
+			;;
+	esac
+}
+
+ensure_python_runtime() {
+	if find_python_cmd >/dev/null 2>&1; then
+		local found
+		found="$(find_python_cmd)"
+		log "python runtime detected: $found ($($found --version 2>&1))"
+		return
+	fi
+
+	if ! ask_yes_no "Python >=3.11 not found. Install now?"; then
+		echo "[setup] ERROR: Python >=3.11 is required" >&2
+		exit 1
+	fi
+
+	log "installing Python runtime"
+	install_python_for_os
+	hash -r
+
+	if ! find_python_cmd >/dev/null 2>&1; then
+		echo "[setup] ERROR: Python installation completed but Python >=3.11 still not found" >&2
+		exit 1
+	fi
+}
+
+install_node_for_os() {
+	case "$OS_FAMILY" in
+		windows)
+			if command -v winget >/dev/null 2>&1; then
+				powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "winget install -e --id OpenJS.NodeJS.LTS --accept-package-agreements --accept-source-agreements"
+			elif command -v choco >/dev/null 2>&1; then
+				choco install -y nodejs-lts
+			else
+				echo "[setup] ERROR: no supported package manager found on Windows (winget/choco)" >&2
+				exit 1
+			fi
+			;;
+		macos)
+			ensure_brew
+			brew install node
+			;;
+		linux)
+			if command -v apt-get >/dev/null 2>&1; then
+				run_with_sudo apt-get update
+				run_with_sudo apt-get install -y nodejs npm
+			elif command -v dnf >/dev/null 2>&1; then
+				run_with_sudo dnf install -y nodejs npm
+			elif command -v yum >/dev/null 2>&1; then
+				run_with_sudo yum install -y nodejs npm
+			elif command -v pacman >/dev/null 2>&1; then
+				run_with_sudo pacman -Sy --noconfirm nodejs npm
+			else
+				echo "[setup] ERROR: no supported Linux package manager found (apt/dnf/yum/pacman)" >&2
+				exit 1
+			fi
+			;;
+		*)
+			echo "[setup] ERROR: unsupported OS for automatic Node.js installation" >&2
+			exit 1
+			;;
+	esac
+}
+
+ensure_node_runtime() {
+	if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+		log "node runtime detected: $(node --version), npm $(npm --version)"
+		return
+	fi
+
+	if ! ask_yes_no "Node.js (node + npm) not found. Install now?"; then
+		echo "[setup] ERROR: Node.js is required" >&2
+		exit 1
+	fi
+
+	log "installing Node.js runtime"
+	install_node_for_os
+	hash -r
+
+	if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+		echo "[setup] ERROR: Node.js installation completed but node/npm is still not available" >&2
+		exit 1
+	fi
 }
 
 port_is_free() {
@@ -50,7 +283,8 @@ host = sys.argv[1]
 port = int(sys.argv[2])
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+	sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
 try:
 	sock.bind((host, port))
 except OSError:
@@ -74,7 +308,8 @@ start_port = int(sys.argv[2])
 
 for port in range(start_port, start_port + 200):
 	sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-	sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+	if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+		sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
 	try:
 		sock.bind((host, port))
 	except OSError:
@@ -217,8 +452,10 @@ find_chrome_bin() {
 maybe_launch_chrome_debug() {
 	local python_bin="$1"
 	local cdp_url="$2"
+	local launch_now
 	local requested_cdp_port
 	local cdp_port
+	launch_now="${AUTO_LAUNCH_CHROME:-0}"
 	requested_cdp_port="$(extract_cdp_port "$cdp_url")"
 	cdp_port="$requested_cdp_port"
 
@@ -227,28 +464,44 @@ maybe_launch_chrome_debug() {
 		return
 	fi
 
-	if [[ "${AUTO_LAUNCH_CHROME:-0}" == "1" ]] && ! port_is_free "$python_bin" "127.0.0.1" "$requested_cdp_port"; then
+	if [[ "$launch_now" == "1" ]] && ! port_is_free "$python_bin" "127.0.0.1" "$requested_cdp_port"; then
 		cdp_port="$(find_free_port "$python_bin" "127.0.0.1" "$requested_cdp_port")"
 		cdp_url="$(replace_url_port "$python_bin" "$cdp_url" "$cdp_port")"
 		export GEMINI_CDP_URL="$cdp_url"
 		log "CDP port ${requested_cdp_port} is busy, switched Chrome debug port to ${cdp_port}"
 	fi
 
-	if [[ "${AUTO_LAUNCH_CHROME:-0}" != "1" ]]; then
+	if [[ "$launch_now" != "1" && "$ASSUME_YES" != "1" ]] && [[ -t 0 ]]; then
+		if ask_yes_no "Chrome CDP endpoint is not reachable at $cdp_url. Launch Chrome automatically now?"; then
+			launch_now="1"
+		fi
+	fi
+
+	if [[ "$launch_now" != "1" ]]; then
 		cat <<EOF
 [setup] Chrome CDP endpoint is not reachable at $cdp_url
 [setup] Start Chrome with debug port, for example:
   "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --remote-debugging-port=$cdp_port --user-data-dir="C:\\tmp\\chrome-gemini-debug"
 [setup] Then open Gemini tab and login.
 EOF
-		exit 1
+		if [[ "${STRICT_CDP_STARTUP:-0}" == "1" ]]; then
+			exit 1
+		fi
+		log "continuing without active CDP endpoint (chat/image calls will fail until Chrome debug is available)"
+		return
 	fi
+
+	export AUTO_LAUNCH_CHROME="1"
 
 	local chrome_bin
 	chrome_bin="$(find_chrome_bin)"
 	if [[ -z "$chrome_bin" ]]; then
 		echo "[setup] ERROR: AUTO_LAUNCH_CHROME=1 but no Chrome binary found" >&2
-		exit 1
+		if [[ "${STRICT_CDP_STARTUP:-0}" == "1" ]]; then
+			exit 1
+		fi
+		log "continuing without active CDP endpoint"
+		return
 	fi
 
 	local profile_dir="$ROOT_DIR/.chrome-debug-profile"
@@ -266,7 +519,10 @@ EOF
 	done
 
 	echo "[setup] ERROR: Chrome launched but CDP endpoint is still not reachable at $cdp_url" >&2
-	exit 1
+	if [[ "${STRICT_CDP_STARTUP:-0}" == "1" ]]; then
+		exit 1
+	fi
+	log "continuing without active CDP endpoint"
 }
 
 start_server() {
@@ -293,6 +549,10 @@ start_server() {
 }
 
 ensure_uv
+detect_os
+log "detected OS: $OS_FAMILY"
+ensure_python_runtime
+ensure_node_runtime
 ensure_venv_and_deps
 
 VENV_PYTHON="$(resolve_venv_python)"
