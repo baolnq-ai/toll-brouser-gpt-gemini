@@ -52,8 +52,12 @@ def _start_daemon(home_dir: Path, session: str = 'default', timeout: float = 10.
 			try:
 				state = json.loads(state_path.read_text())
 				if state.get('phase') in ('ready', 'running'):
+					state_pid = int(state.get('pid') or 0)
 					log_file.close()
-					return proc.pid
+					# On some Windows setups, subprocess PID can be a launcher PID.
+					# Use daemon-reported PID when available so lifecycle assertions
+					# and shutdown target the actual running daemon process.
+					return state_pid if state_pid > 0 else proc.pid
 			except (json.JSONDecodeError, OSError):
 				pass
 		time.sleep(0.1)

@@ -29,6 +29,11 @@ Usage:
 Environment variables:
 	Config is loaded in this order: .env.example, then .env (if present)
 	GEMINI_CDP_URL            Default: http://127.0.0.1:9222
+	CHAT_BRIDGE_DISCOVERY_PORTS Default: 9222,9223,9224
+	GEMINI_OPEN_URL           Default: https://gemini.google.com/app
+	GPT_OPEN_URL              Default: https://chatgpt.com/
+	GEMINI_DEFAULT_TIMEOUT_S  Default: 600
+	GPT_DEFAULT_TIMEOUT_S     Default: 600
 	GEMINI_API_HOST           Default: 0.0.0.0
 	GEMINI_API_PORT           Default: 8008
 	GEMINI_API_LOG_LEVEL      Default: info
