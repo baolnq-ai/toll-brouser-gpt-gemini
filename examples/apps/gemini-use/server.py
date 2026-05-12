@@ -14,10 +14,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+from collections import deque
 import json
 import logging
 import mimetypes
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import tempfile
@@ -29,8 +31,8 @@ from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse, Response
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from browser_use import BrowserProfile, BrowserSession
@@ -38,6 +40,11 @@ from browser_use.browser.events import SwitchTabEvent
 
 ChatProvider = Literal['gemini', 'gpt']
 ChatMode = Literal['fast', 'reasoning', 'pro']
+
+
+IMAGE_STORAGE_DIR = Path(
+	os.getenv('CHAT_BRIDGE_IMAGE_DIR', os.path.join(os.getcwd(), 'generated-images'))
+).resolve()
 
 
 def _to_bool(value: str | None, default: bool = False) -> bool:
@@ -96,6 +103,32 @@ def _parse_discovery_ports(raw: str | None) -> tuple[int, ...]:
 		if 1 <= candidate <= 65535:
 			ports.append(candidate)
 	return tuple(sorted(set(ports)))
+
+
+def _ensure_image_storage_dir() -> Path:
+	IMAGE_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+	return IMAGE_STORAGE_DIR
+
+
+def _safe_image_file_name(file_name: str) -> str:
+	safe_name = os.path.basename(str(file_name or '').strip())
+	if not safe_name or safe_name in {'.', '..'} or safe_name != file_name:
+		raise AutomationError(
+			'IMAGE_FILE_INVALID',
+			'Invalid image file name.',
+			status_code=400,
+			details={'file_name': file_name},
+		)
+	return safe_name
+
+
+def _resolve_image_file_path(file_name: str) -> Path:
+	safe_name = _safe_image_file_name(file_name)
+	return _ensure_image_storage_dir() / safe_name
+
+
+def _build_download_url(file_name: str) -> str:
+	return f'/v1/image/download/{file_name}'
 
 
 def _probe_cdp_sync(cdp_url: str) -> tuple[bool, dict[str, Any]]:
@@ -177,6 +210,10 @@ def _launch_local_chrome_cdp_sync(cdp_url: str, port: int) -> dict[str, Any]:
 		f'--user-data-dir={profile_dir}',
 		'--no-first-run',
 		'--no-default-browser-check',
+		'--disable-renderer-backgrounding',
+		'--disable-background-timer-throttling',
+		'--disable-backgrounding-occluded-windows',
+		'--disable-features=CalculateNativeWinOcclusion',
 	]
 
 	if os.name == 'nt':
@@ -218,6 +255,46 @@ def _launch_local_chrome_cdp_sync(cdp_url: str, port: int) -> dict[str, Any]:
 		'reason': 'cdp_not_ready_after_launch',
 		'chrome_bin': chrome_bin,
 		'profile_dir': profile_dir,
+	}
+
+
+def _activate_chrome_window_sync() -> dict[str, Any]:
+	if os.name != 'nt':
+		return {'attempted': False, 'reason': 'unsupported_os'}
+
+	powershell_candidates = [
+		shutil.which('powershell'),
+		shutil.which('pwsh'),
+	]
+	powershell = next((candidate for candidate in powershell_candidates if candidate), None)
+	if not powershell:
+		return {'attempted': False, 'reason': 'powershell_not_found'}
+
+	script = (
+		"$ws=New-Object -ComObject WScript.Shell;"
+		"$ok=$ws.AppActivate('Google Chrome');"
+		"if(-not $ok){$ok=$ws.AppActivate('Chrome');};"
+		"if($ok){'ok'}else{'not-found'}"
+	)
+	try:
+		result = subprocess.run(
+			[powershell, '-NoProfile', '-NonInteractive', '-Command', script],
+			capture_output=True,
+			text=True,
+			timeout=3,
+		)
+	except Exception as e:
+		return {'attempted': True, 'reason': 'activation_failed', 'error': str(e)}
+
+	output = (result.stdout or '').strip().lower()
+	if result.returncode == 0 and output == 'ok':
+		return {'attempted': True, 'activated': True}
+	return {
+		'attempted': True,
+		'activated': False,
+		'returncode': result.returncode,
+		'stdout': (result.stdout or '').strip(),
+		'stderr': (result.stderr or '').strip(),
 	}
 
 
@@ -322,7 +399,8 @@ class GeneratedImage(BaseModel):
 	file_name: str
 	content_type: str
 	byte_size: int
-	base64_data: str | None = None
+	local_path: str | None = None
+	download_url: str | None = None
 	source_url: str | None = None
 	width: int | None = None
 	height: int | None = None
@@ -350,6 +428,18 @@ class ImageResponse(BaseModel):
 	error_message: str | None = None
 	details: dict[str, Any] | None = None
 	elapsed_ms: int
+
+
+class ClearImagesRequest(BaseModel):
+	provider: ChatProvider | None = None
+
+
+class ClearImagesResponse(BaseModel):
+	success: bool
+	provider: ChatProvider | None = None
+	cleared_files: int
+	remaining_files: int
+	folder: str
 
 
 PortNumber = Annotated[int, Field(ge=1, le=65535)]
@@ -455,6 +545,14 @@ ERROR_KEYWORDS = (
 
 IMAGE_TOOL_KEYWORDS = ('create image', 'generate image', 'image')
 STREAM_SETTLE_GRACE_SECONDS = 12.0
+# Chat-only fallback: if answer text has not changed for N seconds, return it even if UI still shows loading.
+CHAT_STALE_CONTENT_RETURN_S = max(1.0, _to_float(os.getenv('CHAT_BRIDGE_CHAT_STALE_CONTENT_RETURN_S'), 2.0))
+CHAT_STALE_MIN_WORDS = max(1, _to_int(os.getenv('CHAT_BRIDGE_CHAT_STALE_MIN_WORDS'), 2))
+CHAT_STALE_MIN_CHARS = max(4, _to_int(os.getenv('CHAT_BRIDGE_CHAT_STALE_MIN_CHARS'), 10))
+FORCE_RESTORE_WINDOW = _to_bool(os.getenv('CHAT_BRIDGE_FORCE_RESTORE_WINDOW'), default=True)
+FORCE_PAGE_ACTIVE_STATE = _to_bool(os.getenv('CHAT_BRIDGE_FORCE_PAGE_ACTIVE_STATE'), default=True)
+FORCE_FOREGROUND_WINDOW = _to_bool(os.getenv('CHAT_BRIDGE_FORCE_FOREGROUND_WINDOW'), default=True)
+FOREGROUND_RETRY_INTERVAL_S = max(0.5, _to_float(os.getenv('CHAT_BRIDGE_FOREGROUND_RETRY_INTERVAL_S'), 2.0))
 
 
 SNAPSHOT_JS = r"""
@@ -471,10 +569,15 @@ SNAPSHOT_JS = r"""
 	const norm = (s) => (s || '').toLowerCase();
 
 	const composerSelectors = [
+		'#prompt-textarea',
+		'textarea[data-testid*="prompt" i]',
 		'textarea[aria-label*="message" i]',
 		'textarea[placeholder*="message" i]',
+		'textarea[placeholder*="ask" i]',
+		'textarea',
 		'div[contenteditable="true"][role="textbox"]',
 		'div[contenteditable="true"][aria-label*="message" i]',
+		'div[contenteditable="true"][aria-label*="ask" i]',
 		'div[contenteditable="true"][data-testid*="input" i]',
 		'div[contenteditable="true"]'
 	];
@@ -489,8 +592,9 @@ SNAPSHOT_JS = r"""
 	}
 
 	const sendButtonSelectors = [
-		'button[aria-label*="send" i]',
 		'button[data-testid*="send" i]',
+		'button[aria-label="Send prompt" i]',
+		'button[aria-label*="send" i]',
 		'button[type="submit"]'
 	];
 
@@ -504,13 +608,32 @@ SNAPSHOT_JS = r"""
 	}
 
 	const allButtons = Array.from(document.querySelectorAll('button, [role="button"]')).filter(visible);
-	const stopButton = allButtons.find((btn) => {
-		const t = norm(textOf(btn) + ' ' + (btn.getAttribute('aria-label') || ''));
-		return t.includes('stop generating') || t.includes('stop response');
-	});
+	const stopButtonSelectors = [
+		'button[data-testid*="stop" i]',
+		'button[aria-label*="stop" i]'
+	];
+	let stopButton = null;
+	for (const sel of stopButtonSelectors) {
+		const list = Array.from(document.querySelectorAll(sel)).filter(visible);
+		if (list.length > 0) {
+			stopButton = list[list.length - 1];
+			break;
+		}
+	}
+	if (!stopButton) {
+		stopButton = allButtons.find((btn) => {
+			const t = norm(textOf(btn) + ' ' + (btn.getAttribute('aria-label') || ''));
+			return t.includes('stop generating') || t.includes('stop response') || t === 'stop';
+		});
+	}
 
 	const responseSelectors = [
 		'[data-message-author-role="assistant"]',
+		'[data-message-author-role="assistant"] .markdown',
+		'[data-message-author-role="assistant"] [class*="markdown" i]',
+		'article[data-testid*="conversation-turn" i]',
+		'[data-testid*="assistant" i]',
+		'[data-testid*="conversation-turn" i] [class*="markdown" i]',
 		'[data-testid*="response" i]',
 		'[data-test-id*="response" i]',
 		'main structured-content-container',
@@ -601,10 +724,15 @@ def build_send_prompt_js(prompt: str) -> str:
 	const textValue = (el) => ('value' in el ? (el.value || '') : (el.textContent || '')).trim();
 
 	const composerSelectors = [
+		'#prompt-textarea',
+		'textarea[data-testid*="prompt" i]',
 		'textarea[aria-label*="message" i]',
 		'textarea[placeholder*="message" i]',
+		'textarea[placeholder*="ask" i]',
+		'textarea',
 		'div[contenteditable="true"][role="textbox"]',
 		'div[contenteditable="true"][aria-label*="message" i]',
+		'div[contenteditable="true"][aria-label*="ask" i]',
 		'div[contenteditable="true"][data-testid*="input" i]',
 		'div[contenteditable="true"]'
 	];
@@ -717,7 +845,7 @@ CLICK_SEND_BUTTON_JS = r"""
 		return r.width > 1 && r.height > 1;
 	};
 
-	const sendButton = Array.from(document.querySelectorAll('button[aria-label*="send" i], button[data-testid*="send" i], button[type="submit"]'))
+	const sendButton = Array.from(document.querySelectorAll('button[data-testid*="send" i], button[aria-label="Send prompt" i], button[aria-label*="send" i], button[type="submit"]'))
 		.filter(visible)
 		.find((btn) => !(btn.disabled || btn.getAttribute('aria-disabled') === 'true'));
 	if (sendButton) {
@@ -764,6 +892,46 @@ CLICK_NEW_CHAT_JS = r"""
 """
 
 
+DISMISS_BLOCKING_UI_JS = r"""
+(function() {
+	const visible = (el) => {
+		if (!el) return false;
+		const s = window.getComputedStyle(el);
+		if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+		const r = el.getBoundingClientRect();
+		return r.width > 1 && r.height > 1;
+	};
+	const textOf = (el) => ((el && (el.innerText || el.textContent)) || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+	const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], .modal, [class*="dialog" i]')).filter(visible);
+	if (!dialogs.length) {
+		return { ok: true, closed: false, reason: 'no-dialog' };
+	}
+
+	const closeKeywords = ['close', 'dismiss', 'cancel', 'done', 'back'];
+	let closed = false;
+	for (const dialog of dialogs) {
+		const controls = Array.from(dialog.querySelectorAll('button, [role="button"], [aria-label], .close'));
+		for (const control of controls) {
+			if (!visible(control)) continue;
+			const joined = `${textOf(control)} ${(control.getAttribute('aria-label') || '').toLowerCase()}`;
+			if (!closeKeywords.some((keyword) => joined.includes(keyword))) continue;
+			control.click();
+			closed = true;
+			break;
+		}
+	}
+
+	if (!closed) {
+		document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }));
+		document.dispatchEvent(new KeyboardEvent('keyup', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }));
+	}
+
+	return { ok: true, closed: true, method: closed ? 'button' : 'escape' };
+})();
+"""
+
+
 CLICK_CREATE_IMAGE_TOOL_JS = r"""
 (function() {
 	const visible = (el) => {
@@ -801,10 +969,24 @@ IMAGE_SNAPSHOT_JS = r"""
 	const norm = (s) => (s || '').toLowerCase();
 
 	const allButtons = Array.from(document.querySelectorAll('button, [role="button"]')).filter(visible);
-	const stopButton = allButtons.find((btn) => {
-		const t = norm(textOf(btn) + ' ' + (btn.getAttribute('aria-label') || ''));
-		return t.includes('stop generating') || t.includes('stop response');
-	});
+	const stopButtonSelectors = [
+		'button[data-testid*="stop" i]',
+		'button[aria-label*="stop" i]'
+	];
+	let stopButton = null;
+	for (const sel of stopButtonSelectors) {
+		const list = Array.from(document.querySelectorAll(sel)).filter(visible);
+		if (list.length > 0) {
+			stopButton = list[list.length - 1];
+			break;
+		}
+	}
+	if (!stopButton) {
+		stopButton = allButtons.find((btn) => {
+			const t = norm(textOf(btn) + ' ' + (btn.getAttribute('aria-label') || ''));
+			return t.includes('stop generating') || t.includes('stop response') || t === 'stop';
+		});
+	}
 
 	const imageCandidates = [];
 	const seen = new Set();
@@ -940,6 +1122,19 @@ def build_extract_image_js(candidate: dict[str, Any]) -> str:
 		reader.onerror = () => reject(reader.error || new Error('file-reader-failed'));
 		reader.readAsDataURL(blob);
 	}});
+	const dismissPreview = () => {{
+		const closeKeywords = ['close', 'dismiss', 'cancel', 'done', 'back'];
+		const controls = Array.from(document.querySelectorAll('button,[role="button"],[aria-label],.close')).filter(visible);
+		for (const control of controls) {{
+			const joined = `${{(control.innerText || control.textContent || '').toLowerCase()}} ${{(control.getAttribute('aria-label') || '').toLowerCase()}}`;
+			if (!closeKeywords.some((keyword) => joined.includes(keyword))) continue;
+			control.click();
+			return 'button';
+		}}
+		document.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }}));
+		document.dispatchEvent(new KeyboardEvent('keyup', {{ key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }}));
+		return 'escape';
+	}};
 
 	const sourceUrl = candidate.sourceUrl || '';
 	if (candidate.kind === 'generated-image-button') {{
@@ -961,13 +1156,14 @@ def build_extract_image_js(candidate: dict[str, Any]) -> str:
 				const ctx = canvas.getContext('2d');
 				ctx.drawImage(preview, 0, 0);
 				const dataUrl = canvas.toDataURL('image/png');
-				const closeButton = Array.from(document.querySelectorAll('button,[role="button"]')).find((el) => ((el.innerText || el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase().includes('close'));
-				if (closeButton) closeButton.click();
+				dismissPreview();
 				return {{ ok: true, dataUrl, sourceUrl: preview.currentSrc || preview.src || sourceUrl, contentType: 'image/png', width: preview.naturalWidth, height: preview.naturalHeight, buttonIndex: candidate.buttonIndex }};
 			}} catch (error) {{
+				dismissPreview();
 				return {{ ok: false, error: 'preview-canvas-failed', reason: String(error), sourceUrl }};
 			}}
 		}}
+		dismissPreview();
 		return {{ ok: false, error: 'preview-image-not-ready', sourceUrl }};
 	}}
 
@@ -1009,6 +1205,7 @@ class GeminiBridgeService:
 		self._default_port = _parse_port_from_cdp_url(cfg.cdp_url)
 		self._sessions: dict[int, BrowserSession] = {}
 		self._startup_lock = asyncio.Lock()
+		self._last_foreground_attempt_at = 0.0
 
 	async def startup(self) -> None:
 		async with self._startup_lock:
@@ -1158,7 +1355,8 @@ class GeminiBridgeService:
 		try:
 			async with asyncio.timeout(effective_timeout):
 				session = await self._ensure_session(force_reconnect=False, cdp_port=resolved_port)
-				tab = await self._ensure_provider_tab(session)
+				tab = await self._ensure_provider_tab(session, force_activate=True)
+				await self._dismiss_blocking_ui(session)
 
 				if mode is not None and self.cfg.supports_mode:
 					mode_applied = await self._apply_mode(session, mode)
@@ -1196,7 +1394,7 @@ class GeminiBridgeService:
 				if not isinstance(send_result, dict) or not send_result.get('ok'):
 					raise AutomationError(
 						'PROMPT_SEND_FAILED',
-						'Failed to write prompt into Gemini composer.',
+						f'Failed to write prompt into {self.cfg.display_name} composer.',
 						status_code=502,
 						details={'send_result': send_result},
 					)
@@ -1208,7 +1406,7 @@ class GeminiBridgeService:
 					if typed_prompt != prompt.strip():
 						raise AutomationError(
 							'PROMPT_WRITE_NOT_CONFIRMED',
-							'Prompt did not persist in Gemini composer after input attempt.',
+							f'Prompt did not persist in {self.cfg.display_name} composer after input attempt.',
 							status_code=502,
 							details={'send_result': send_result, 'post_type': post_type},
 						)
@@ -1217,7 +1415,7 @@ class GeminiBridgeService:
 				if not isinstance(submit_result, dict) or not submit_result.get('ok'):
 					raise AutomationError(
 						'PROMPT_SUBMIT_FAILED',
-						'Failed to trigger Gemini prompt submission.',
+						f'Failed to trigger {self.cfg.display_name} prompt submission.',
 						status_code=502,
 						details={'submit_result': submit_result},
 					)
@@ -1234,7 +1432,7 @@ class GeminiBridgeService:
 					if not isinstance(retry_send, dict) or not retry_send.get('ok'):
 						raise AutomationError(
 							'PROMPT_SUBMIT_NOT_CONFIRMED',
-							'Prompt remained in Gemini composer after submission attempt.',
+							f'Prompt remained in {self.cfg.display_name} composer after submission attempt.',
 							status_code=502,
 							details={'send_result': send_result, 'retry_send': retry_send, 'post_send': post_send},
 						)
@@ -1291,7 +1489,8 @@ class GeminiBridgeService:
 		try:
 			async with asyncio.timeout(effective_timeout):
 				session = await self._ensure_session(force_reconnect=False, cdp_port=resolved_port)
-				tab = await self._ensure_provider_tab(session)
+				tab = await self._ensure_provider_tab(session, force_activate=True)
+				await self._dismiss_blocking_ui(session)
 
 				new_chat_result = await self._run_js(session, CLICK_NEW_CHAT_JS)
 				if isinstance(new_chat_result, dict) and new_chat_result.get('ok'):
@@ -1476,7 +1675,7 @@ class GeminiBridgeService:
 			},
 		)
 
-	async def _switch_to_gemini_tab(self, session: BrowserSession):
+	async def _switch_to_gemini_tab(self, session: BrowserSession, *, force_activate: bool = False):
 		tabs = await session.get_tabs()
 		if not tabs:
 			raise AutomationError('NO_TABS_FOUND', 'No browser tabs found in connected Chrome instance.', status_code=409)
@@ -1505,16 +1704,16 @@ class GeminiBridgeService:
 		if selected is None:
 			selected = candidates[0]
 
-		if selected.target_id != current_target:
+		if selected.target_id != current_target or force_activate:
 			event = session.event_bus.dispatch(SwitchTabEvent(target_id=selected.target_id))
 			await event
 			await event.event_result(raise_if_any=True, raise_if_none=False)
 
 		return selected
 
-	async def _ensure_provider_tab(self, session: BrowserSession):
+	async def _ensure_provider_tab(self, session: BrowserSession, *, force_activate: bool = False):
 		try:
-			return await self._switch_to_gemini_tab(session)
+			return await self._switch_to_gemini_tab(session, force_activate=force_activate)
 		except AutomationError as error:
 			missing_codes = {
 				'NO_TABS_FOUND',
@@ -1533,7 +1732,13 @@ class GeminiBridgeService:
 
 		await session.navigate_to(target_url, new_tab=True)
 		await asyncio.sleep(0.8)
-		return await self._switch_to_gemini_tab(session)
+		return await self._switch_to_gemini_tab(session, force_activate=True)
+
+	async def _dismiss_blocking_ui(self, session: BrowserSession) -> None:
+		try:
+			await self._run_js(session, DISMISS_BLOCKING_UI_JS, ensure_tab=False)
+		except Exception:
+			return
 
 	async def _apply_mode(self, session: BrowserSession, mode: ChatMode) -> bool:
 		targets = MODE_TARGETS.get(mode)
@@ -1591,6 +1796,7 @@ class GeminiBridgeService:
 		last_streaming_at = 0.0
 		best_answer = ''
 		best_signature = ''
+		last_answer_change_at = started
 		baseline_norm = baseline_last.strip()
 
 		while True:
@@ -1640,9 +1846,12 @@ class GeminiBridgeService:
 			candidate_texts = new_tail if new_tail else ([last_text] if last_text and last_text != baseline_norm else [])
 			candidate_text = candidate_texts[-1] if candidate_texts else ''
 			candidate_signature = json.dumps(candidate_texts[-2:], ensure_ascii=False)
+			previous_best = best_answer
 			if candidate_text and (len(candidate_text) >= len(best_answer) or candidate_signature != best_signature):
 				best_answer = candidate_text
 				best_signature = candidate_signature
+			if best_answer != previous_best:
+				last_answer_change_at = time.time()
 
 			new_by_count = response_count > baseline_count
 			new_by_text = bool(candidate_text)
@@ -1658,7 +1867,22 @@ class GeminiBridgeService:
 					stable_count = 0
 
 				last_seen_signature = signature
-				if stable_count >= self.cfg.stable_polls and not is_streaming:
+				send_ready = bool(snapshot.get('sendButtonFound')) and not bool(snapshot.get('sendDisabled'))
+				answer_idle_s = time.time() - last_answer_change_at
+				word_count = len([token for token in best_answer.split() if token.strip()])
+				has_meaningful_stream_text = word_count >= CHAT_STALE_MIN_WORDS or len(best_answer) >= CHAT_STALE_MIN_CHARS
+				if stable_count >= self.cfg.stable_polls and (
+					not is_streaming
+					or (
+						has_meaningful_stream_text
+						and send_ready
+						and answer_idle_s >= max(1.0, self.cfg.poll_interval_s * 2.0)
+					)
+					or (
+						has_meaningful_stream_text
+						and answer_idle_s >= CHAT_STALE_CONTENT_RETURN_S
+					)
+				):
 					return best_answer
 
 			await asyncio.sleep(self.cfg.poll_interval_s)
@@ -1826,14 +2050,17 @@ class GeminiBridgeService:
 		ext = mimetypes.guess_extension(content_type) or '.bin'
 		if ext == '.jpe':
 			ext = '.jpg'
-		file_name = f'{self.cfg.provider}_{request_id}_{index + 1}{ext}'
-		base64_data = base64.b64encode(content).decode('ascii')
+		file_name = f'{self.cfg.provider}_{request_id}_{index + 1}_{uuid4().hex[:8]}{ext}'
+		file_path = _ensure_image_storage_dir() / file_name
+		with file_path.open('wb') as handle:
+			handle.write(content)
 
 		return GeneratedImage(
 			file_name=file_name,
 			content_type=content_type,
 			byte_size=len(content),
-			base64_data=base64_data,
+			local_path=str(file_path),
+			download_url=_build_download_url(file_name),
 			source_url=source_url,
 			width=_to_int(str(payload.get('width')) if payload.get('width') is not None else None, 0) or None,
 			height=_to_int(str(payload.get('height')) if payload.get('height') is not None else None, 0) or None,
@@ -1844,14 +2071,56 @@ class GeminiBridgeService:
 		with urlopen(request, timeout=60) as response:
 			return response.read()
 
-	async def _run_js(self, session: BrowserSession, expression: str) -> Any:
+	async def _run_js(self, session: BrowserSession, expression: str, *, ensure_tab: bool = True) -> Any:
 		active_session = session
 		port = self._find_port_for_session(session)
 		last_error: Exception | None = None
 
 		for attempt in range(2):
 			try:
+				if ensure_tab:
+					await self._ensure_provider_tab(active_session, force_activate=True)
+				now = time.time()
+				if FORCE_FOREGROUND_WINDOW and (now - self._last_foreground_attempt_at) >= FOREGROUND_RETRY_INTERVAL_S:
+					self._last_foreground_attempt_at = now
+					try:
+						await asyncio.to_thread(_activate_chrome_window_sync)
+					except Exception:
+						pass
 				cdp_session = await active_session.get_or_create_cdp_session(focus=True)
+				if FORCE_RESTORE_WINDOW:
+					try:
+						target_id = getattr(cdp_session, 'target_id', None) or active_session.agent_focus_target_id
+						if target_id:
+							window_info = await cdp_session.cdp_client.send.Browser.getWindowForTarget(params={'targetId': target_id})
+							window_id = window_info.get('windowId')
+							bounds = window_info.get('bounds') or {}
+							state = str(bounds.get('windowState') or '').lower()
+							if window_id is not None and state == 'minimized':
+								await cdp_session.cdp_client.send.Browser.setWindowBounds(
+									params={'windowId': window_id, 'bounds': {'windowState': 'normal'}}
+								)
+					except Exception:
+						pass
+				try:
+					await cdp_session.cdp_client.send.Page.bringToFront(session_id=cdp_session.session_id)
+				except Exception:
+					pass
+				if FORCE_PAGE_ACTIVE_STATE:
+					try:
+						await cdp_session.cdp_client.send.Page.setWebLifecycleState(
+							params={'state': 'active'},
+							session_id=cdp_session.session_id,
+						)
+					except Exception:
+						pass
+					try:
+						await cdp_session.cdp_client.send.Emulation.setFocusEmulationEnabled(
+							params={'enabled': True},
+							session_id=cdp_session.session_id,
+						)
+					except Exception:
+						pass
 				result = await cdp_session.cdp_client.send.Runtime.evaluate(
 					params={
 						'expression': expression,
@@ -1876,7 +2145,7 @@ class GeminiBridgeService:
 				last_error = e
 				if attempt == 0:
 					active_session = await self._ensure_session(force_reconnect=True, cdp_port=port)
-					await self._switch_to_gemini_tab(active_session)
+					await self._switch_to_gemini_tab(active_session, force_activate=True)
 					continue
 
 		reason = str(last_error) if last_error is not None else 'unknown error'
@@ -1925,6 +2194,8 @@ class PortScheduler:
 		self._reserved_ports: set[int] = set()
 		self._cursor = 0
 		self._state_lock = asyncio.Lock()
+		self._state_changed = asyncio.Condition(self._state_lock)
+		self._wait_queue: deque[str] = deque()
 
 	def register_ports(self, ports: list[int]) -> None:
 		for port in ports:
@@ -1941,64 +2212,93 @@ class PortScheduler:
 			)
 
 		self.register_ports(ports)
+		token = uuid4().hex
 
-		while True:
-			now = time.time()
-			if now >= deadline:
-				raise AutomationError(
-					'NO_PORTS_AVAILABLE',
-					f'No available {self.label} port before request deadline.',
-					status_code=504,
-				)
+		async with self._state_lock:
+			self._wait_queue.append(token)
+			self._state_changed.notify_all()
 
-			port = await self._reserve_ready_port(ports)
-			if port is not None:
+		try:
+			while True:
+				now = time.time()
+				if now >= deadline:
+					raise AutomationError(
+						'NO_PORTS_AVAILABLE',
+						f'No available {self.label} port before request deadline.',
+						status_code=504,
+					)
+
+				port: int | None = None
+				async with self._state_lock:
+					while True:
+						now = time.time()
+						if now >= deadline:
+							raise AutomationError(
+								'NO_PORTS_AVAILABLE',
+								f'No available {self.label} port before request deadline.',
+								status_code=504,
+							)
+
+						if self._wait_queue and self._wait_queue[0] == token:
+							port = self._reserve_ready_port_locked(ports, now)
+							if port is not None:
+								self._wait_queue.popleft()
+								self._state_changed.notify_all()
+								break
+
+						wait_for = min(self._wait_duration_locked(ports, now), max(0.05, deadline - now))
+						try:
+							await asyncio.wait_for(self._state_changed.wait(), timeout=wait_for)
+						except TimeoutError:
+							pass
+
+				if port is None:
+					continue
+
 				lock = self._locks[port]
 				await lock.acquire()
-				cooldown_until = self._cooldown_until.get(port, 0.0)
-				if cooldown_until > time.time():
-					self.release_port(port)
-					await asyncio.sleep(min(0.2, max(0.05, cooldown_until - time.time())))
-					continue
 				return port
+		finally:
+			async with self._state_lock:
+				if token in self._wait_queue:
+					self._wait_queue.remove(token)
+					self._state_changed.notify_all()
 
-			await asyncio.sleep(self._wait_duration(ports))
-
-	def release_port(self, port: int) -> None:
-		self._reserved_ports.discard(port)
-		lock = self._locks.get(port)
-		if lock is not None and lock.locked():
-			lock.release()
+	async def release_port(self, port: int) -> None:
+		async with self._state_lock:
+			self._reserved_ports.discard(port)
+			lock = self._locks.get(port)
+			if lock is not None and lock.locked():
+				lock.release()
+			self._state_changed.notify_all()
 
 	async def mark_cooldown(self, port: int, cooldown_s: float) -> None:
 		until = time.time() + max(1.0, cooldown_s)
 		async with self._state_lock:
 			current = self._cooldown_until.get(port, 0.0)
 			self._cooldown_until[port] = max(current, until)
+			self._state_changed.notify_all()
 
-	async def _reserve_ready_port(self, ports: list[int]) -> int | None:
-		async with self._state_lock:
-			now = time.time()
-			ready = [
-				port
-				for port in ports
-				if self._cooldown_until.get(port, 0.0) <= now
-				and port not in self._reserved_ports
-				and not self._locks[port].locked()
-			]
-			if not ready:
-				return None
+	def _reserve_ready_port_locked(self, ports: list[int], now: float) -> int | None:
+		ready = [
+			port
+			for port in ports
+			if self._cooldown_until.get(port, 0.0) <= now
+			and port not in self._reserved_ports
+			and not self._locks[port].locked()
+		]
+		if not ready:
+			return None
 
-			if self._cursor >= len(ready):
-				self._cursor = 0
+		if self._cursor >= len(ready):
+			self._cursor = 0
 
-			selected = ready[self._cursor]
-			self._cursor = (self._cursor + 1) % len(ready)
-			self._reserved_ports.add(selected)
-			return selected
+		selected = ready[self._cursor]
+		self._cursor = (self._cursor + 1) % len(ready)
+		self._reserved_ports.add(selected)
+		return selected
 
-	def _wait_duration(self, ports: list[int]) -> float:
-		now = time.time()
+	def _wait_duration_locked(self, ports: list[int], now: float) -> float:
 		cooling = [self._cooldown_until.get(port, 0.0) - now for port in ports if self._cooldown_until.get(port, 0.0) > now]
 		if not cooling:
 			return 0.15
@@ -2007,8 +2307,10 @@ class PortScheduler:
 
 GEMINI_SERVICE = GeminiBridgeService(GEMINI_CFG)
 GPT_SERVICE = GeminiBridgeService(GPT_CFG)
-GEMINI_SCHEDULER = PortScheduler('gemini')
-GPT_SCHEDULER = PortScheduler('gpt')
+PORT_SCHEDULER = PortScheduler('bridge')
+# Keep aliases for backward compatibility in tests and external imports.
+GEMINI_SCHEDULER = PORT_SCHEDULER
+GPT_SCHEDULER = PORT_SCHEDULER
 
 
 def _get_service(provider: ChatProvider) -> GeminiBridgeService:
@@ -2020,7 +2322,7 @@ def _all_services() -> dict[ChatProvider, GeminiBridgeService]:
 
 
 def _get_scheduler(provider: ChatProvider) -> PortScheduler:
-	return GPT_SCHEDULER if provider == 'gpt' else GEMINI_SCHEDULER
+	return PORT_SCHEDULER
 
 
 def _is_rate_limit_error(error: AutomationError) -> bool:
@@ -2081,14 +2383,10 @@ def _sanitize_ports(ports: list[int] | None) -> list[int]:
 
 
 def _resolve_request_ports(service: GeminiBridgeService) -> list[int]:
-	managed = service.managed_ports()
-	if managed:
-		return managed
-
-	if DISCOVERY_PORTS:
-		return list(DISCOVERY_PORTS)
-
-	return [service._default_port]
+	ports: set[int] = set(DISCOVERY_PORTS)
+	ports.update(service.managed_ports())
+	ports.add(service._default_port)
+	return sorted(port for port in ports if 1 <= port <= 65535)
 
 
 def _collect_candidate_ports(requested_ports: list[int] | None) -> list[int]:
@@ -2167,7 +2465,7 @@ async def _run_chat_prompt(
 				elapsed_ms=elapsed_ms,
 			)
 		finally:
-			scheduler.release_port(port)
+			await scheduler.release_port(port)
 
 	final_elapsed = int((time.time() - started) * 1000)
 	if last_rate_limit is None:
@@ -2243,7 +2541,7 @@ async def _run_image_prompt(
 				elapsed_ms=elapsed_ms,
 			)
 		finally:
-			scheduler.release_port(port)
+			await scheduler.release_port(port)
 
 	final_elapsed = int((time.time() - started) * 1000)
 	if last_rate_limit is None:
@@ -2269,6 +2567,7 @@ async def _run_image_prompt(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+	_ensure_image_storage_dir()
 	await GEMINI_SERVICE.startup()
 	await GPT_SERVICE.startup()
 	try:
@@ -2342,8 +2641,8 @@ async def _dispatch_chat(provider: ChatProvider, payload: ChatRequest):
 			provider=provider,
 			mode_requested=payload.mode,
 			mode_applied=None,
-			used_port=successes[0].port if successes else None,
-			answer=successes[0].answer if successes else None,
+			used_port=None,
+			answer=None,
 			results=results,
 			error_code=None if successes else 'BATCH_ALL_FAILED',
 			error_message=None if successes else 'All prompts failed.',
@@ -2435,7 +2734,7 @@ async def _dispatch_image(provider: ChatProvider, payload: ImageRequest):
 
 			first_item = successes[0]
 			first_image = (first_item.images or [None])[0]
-			if first_image is None or not first_image.base64_data:
+			if first_image is None or not first_image.local_path:
 				body = ImageResponse(
 					success=False,
 					request_id=request_id,
@@ -2444,20 +2743,35 @@ async def _dispatch_image(provider: ChatProvider, payload: ImageRequest):
 					images=None,
 					results=results,
 					error_code='BINARY_IMAGE_NOT_AVAILABLE',
-					error_message='Binary image output requested but no base64 source found.',
+					error_message='Binary image output requested but no local image path found.',
 					details={'port': first_item.port},
 					elapsed_ms=elapsed_ms,
 				)
 				return JSONResponse(status_code=502, content=body.model_dump(mode='json'))
 
-			binary_bytes = base64.b64decode(first_image.base64_data.encode('ascii'))
+			image_path = Path(first_image.local_path)
+			if not image_path.is_file():
+				body = ImageResponse(
+					success=False,
+					request_id=request_id,
+					provider=provider,
+					used_port=first_item.port,
+					images=None,
+					results=results,
+					error_code='BINARY_IMAGE_NOT_FOUND',
+					error_message='Binary image output requested but file is missing on local storage.',
+					details={'path': str(image_path)},
+					elapsed_ms=elapsed_ms,
+				)
+				return JSONResponse(status_code=404, content=body.model_dump(mode='json'))
+
 			headers = {
 				'Content-Disposition': f'inline; filename={first_image.file_name}',
 				'X-Bridge-Provider': provider,
 				'X-Bridge-Port': str(first_item.port or ''),
 				'X-Bridge-Request-Id': request_id,
 			}
-			return Response(content=binary_bytes, media_type=first_image.content_type, headers=headers)
+			return FileResponse(path=image_path, media_type=first_image.content_type, filename=first_image.file_name, headers=headers)
 
 		if len(prompts) == 1:
 			item = results[0]
@@ -2546,8 +2860,7 @@ async def open_web(payload: OpenWebRequest):
 		return JSONResponse(status_code=422, content=body.model_dump(mode='json'))
 
 	try:
-		results: list[OpenWebResult] = []
-		for port in ports:
+		async def _open_single_port(port: int) -> OpenWebResult:
 			try:
 				result = await GEMINI_SERVICE.open_web(
 					port=port,
@@ -2555,24 +2868,22 @@ async def open_web(payload: OpenWebRequest):
 					new_tab=False,
 					force_reconnect=payload.force_reconnect,
 				)
-				results.append(
-					OpenWebResult(
-						success=True,
-						port=port,
-						cdp_url=str(result.get('cdp_url') or ''),
-					)
+				return OpenWebResult(
+					success=True,
+					port=port,
+					cdp_url=str(result.get('cdp_url') or ''),
 				)
 			except AutomationError as error:
-				results.append(
-					OpenWebResult(
-						success=False,
-						port=port,
-						cdp_url=GEMINI_SERVICE.cdp_url_for_port(port),
-						error_code=error.code,
-						error_message=error.message,
-						details=error.details,
-					)
+				return OpenWebResult(
+					success=False,
+					port=port,
+					cdp_url=GEMINI_SERVICE.cdp_url_for_port(port),
+					error_code=error.code,
+					error_message=error.message,
+					details=error.details,
 				)
+
+		results = await asyncio.gather(*[_open_single_port(port) for port in ports])
 
 		GEMINI_SCHEDULER.register_ports(ports)
 		GPT_SCHEDULER.register_ports(ports)
@@ -2666,6 +2977,53 @@ async def create_image_gemini(payload: ImageRequest):
 @app.post('/v1/image/gpt', response_model=ImageResponse)
 async def create_image_gpt(payload: ImageRequest):
 	return await _dispatch_image('gpt', payload)
+
+
+@app.get('/v1/image/download/{file_name}')
+async def download_image(file_name: str):
+	try:
+		image_path = _resolve_image_file_path(file_name)
+	except AutomationError as error:
+		raise HTTPException(status_code=error.status_code, detail=error.message) from error
+
+	if not image_path.is_file():
+		raise HTTPException(status_code=404, detail='Image file not found.')
+
+	media_type = mimetypes.guess_type(str(image_path))[0] or 'application/octet-stream'
+	return FileResponse(path=image_path, media_type=media_type, filename=image_path.name)
+
+
+@app.post('/v1/image/clear', response_model=ClearImagesResponse)
+async def clear_images(payload: ClearImagesRequest):
+	storage_dir = _ensure_image_storage_dir()
+	cleared_files = 0
+
+	for candidate in storage_dir.iterdir():
+		if not candidate.is_file():
+			continue
+		if payload.provider is not None and not candidate.name.startswith(f'{payload.provider}_'):
+			continue
+		try:
+			candidate.unlink()
+			cleared_files += 1
+		except Exception:
+			continue
+
+	remaining = 0
+	for candidate in storage_dir.iterdir():
+		if not candidate.is_file():
+			continue
+		if payload.provider is not None and not candidate.name.startswith(f'{payload.provider}_'):
+			continue
+		remaining += 1
+
+	return ClearImagesResponse(
+		success=True,
+		provider=payload.provider,
+		cleared_files=cleared_files,
+		remaining_files=remaining,
+		folder=str(storage_dir),
+	)
 
 
 if __name__ == '__main__':
