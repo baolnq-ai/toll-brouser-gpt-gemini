@@ -14,6 +14,8 @@ ASSUME_YES=0
 OS_FAMILY="unknown"
 SETUP_VERBOSE="${SETUP_VERBOSE:-0}"
 SETUP_LOG_FILE="$ROOT_DIR/.setup.log"
+declare -a PYTHON_RUNTIME_CMD=()
+PYTHON_RUNTIME_LABEL=""
 
 : >"$SETUP_LOG_FILE"
 
@@ -193,21 +195,41 @@ run_with_sudo() {
 }
 
 is_python_compatible() {
-	local cmd="$1"
-	"$cmd" - <<'PY' >/dev/null 2>&1
+	"$@" - <<'PY' >/dev/null 2>&1
 import sys
 raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
 PY
+}
+
+set_python_runtime_cmd() {
+	local label arg
+	PYTHON_RUNTIME_CMD=("$@")
+	label="$1"
+	shift
+	for arg in "$@"; do
+		label="$label $arg"
+	done
+	PYTHON_RUNTIME_LABEL="$label"
 }
 
 find_python_cmd() {
 	local candidate
 	for candidate in python3.12 python3.11 python3 python; do
 		if command -v "$candidate" >/dev/null 2>&1 && is_python_compatible "$candidate"; then
-			echo "$candidate"
+			set_python_runtime_cmd "$candidate"
 			return 0
 		fi
 	done
+
+	if command -v py >/dev/null 2>&1; then
+		for candidate in -3.12 -3.11 -3; do
+			if is_python_compatible py "$candidate"; then
+				set_python_runtime_cmd py "$candidate"
+				return 0
+			fi
+		done
+	fi
+
 	return 1
 }
 
@@ -277,10 +299,10 @@ install_python_for_os() {
 }
 
 ensure_python_runtime() {
-	if find_python_cmd >/dev/null 2>&1; then
-		local found
-		found="$(find_python_cmd)"
-		log_ok "python runtime detected: $found ($($found --version 2>&1))"
+	if find_python_cmd; then
+		local version
+		version="$("${PYTHON_RUNTIME_CMD[@]}" --version 2>&1 || true)"
+		log_ok "python runtime detected: ${PYTHON_RUNTIME_LABEL} (${version:-unknown version})"
 		return
 	fi
 
@@ -293,7 +315,7 @@ ensure_python_runtime() {
 	install_python_for_os
 	hash -r
 
-	if ! find_python_cmd >/dev/null 2>&1; then
+	if ! find_python_cmd; then
 		echo "[setup] ERROR: Python installation completed but Python >=3.11 still not found" >&2
 		exit 1
 	fi
