@@ -19,6 +19,7 @@ on:
 
 jobs:
   build_publish_image:
+    if: ${{ github.repository == 'browser-use/browser-use' && secrets.DOCKER_USERNAME != '' && secrets.DOCKER_PASSWORD != '' }}
     runs-on: ubuntu-latest
     permissions:
       packages: write

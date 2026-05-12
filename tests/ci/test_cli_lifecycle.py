@@ -90,7 +90,8 @@ def _kill_daemon(pid: int) -> None:
 			time.sleep(0.1)
 			if not _is_pid_alive(pid):
 				return
-		os.kill(pid, signal.SIGKILL)
+		force_sig = getattr(signal, 'SIGKILL', signal.SIGTERM)
+		os.kill(pid, force_sig)
 	except (OSError, ProcessLookupError):
 		pass
 

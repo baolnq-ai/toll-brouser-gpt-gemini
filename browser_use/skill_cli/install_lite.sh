@@ -17,6 +17,9 @@
 
 set -e
 
+QUIET_INSTALL=1
+INSTALL_LOG_FILE="${INSTALL_LOG_FILE:-$HOME/.browser-use/install.log}"
+
 # =============================================================================
 # Prerequisites
 # =============================================================================
@@ -59,6 +62,52 @@ log_error() {
 	echo -e "${RED}✗${NC} $1"
 }
 
+run_step() {
+	local description="$1"
+	shift
+
+	log_info "$description"
+	if [ "$QUIET_INSTALL" = "1" ]; then
+		if "$@" >>"$INSTALL_LOG_FILE" 2>&1; then
+			return
+		fi
+	else
+		if "$@"; then
+			return
+		fi
+	fi
+
+	log_error "$description failed"
+	if [ "$QUIET_INSTALL" = "1" ]; then
+		echo "Last 60 lines from $INSTALL_LOG_FILE:" >&2
+		tail -n 60 "$INSTALL_LOG_FILE" >&2 || true
+	fi
+	exit 1
+}
+
+run_shell_step() {
+	local description="$1"
+	local shell_command="$2"
+
+	log_info "$description"
+	if [ "$QUIET_INSTALL" = "1" ]; then
+		if bash -lc "$shell_command" >>"$INSTALL_LOG_FILE" 2>&1; then
+			return
+		fi
+	else
+		if bash -lc "$shell_command"; then
+			return
+		fi
+	fi
+
+	log_error "$description failed"
+	if [ "$QUIET_INSTALL" = "1" ]; then
+		echo "Last 60 lines from $INSTALL_LOG_FILE:" >&2
+		tail -n 60 "$INSTALL_LOG_FILE" >&2 || true
+	fi
+	exit 1
+}
+
 # =============================================================================
 # Argument parsing
 # =============================================================================
@@ -73,9 +122,14 @@ parse_args() {
 				echo ""
 				echo "Options:"
 				echo "  --help, -h        Show this help"
+				echo "  --verbose         Show full command output"
 				echo ""
 				echo "Installs Python 3.11+ (if needed), uv, browser-use CLI (minimal deps), and Chromium."
 				exit 0
+				;;
+			--verbose)
+				QUIET_INSTALL=0
+				shift
 				;;
 			*)
 				log_warn "Unknown argument: $1 (ignored)"
@@ -253,7 +307,7 @@ install_uv() {
 		log_error "curl is required but not found. Install curl and try again."
 		exit 1
 	fi
-	curl -LsSf https://astral.sh/uv/install.sh | sh
+	run_shell_step "Installing uv package manager" "curl -LsSf https://astral.sh/uv/install.sh | sh"
 
 	if command -v uv &> /dev/null; then
 		log_success "uv installed successfully"
@@ -274,9 +328,9 @@ install_browser_use() {
 	if [ ! -d "$HOME/.browser-use-env" ]; then
 		# Use discovered Python command (e.g., python3.11) or fall back to version spec
 		if [ -n "$PYTHON_CMD" ]; then
-			uv venv "$HOME/.browser-use-env" --python "$PYTHON_CMD"
+			run_step "Creating browser-use virtual environment" uv venv "$HOME/.browser-use-env" --python "$PYTHON_CMD"
 		else
-			uv venv "$HOME/.browser-use-env" --python 3.11
+			run_step "Creating browser-use virtual environment" uv venv "$HOME/.browser-use-env" --python 3.11
 		fi
 	fi
 
@@ -292,14 +346,13 @@ install_browser_use() {
 	# This avoids pulling ~50 packages (LLM clients, PDF tools, etc.) that
 	# the CLI never imports.
 	local tmp_dir=$(mktemp -d)
-	git clone --depth 1 --branch "$BROWSER_USE_BRANCH" "https://github.com/$BROWSER_USE_REPO.git" "$tmp_dir"
-	uv pip install "$tmp_dir" --no-deps
+	run_step "Cloning browser-use source" git clone --depth 1 --branch "$BROWSER_USE_BRANCH" "https://github.com/$BROWSER_USE_REPO.git" "$tmp_dir"
+	run_step "Installing browser-use package" uv pip install "$tmp_dir" --no-deps
 
 	# Install only the dependencies the CLI actually needs (~10 packages).
 	# The list lives in requirements-cli.txt so it's discoverable and testable.
 	# Transitive deps (e.g. websockets via cdp-use) are resolved automatically.
-	log_info "Installing minimal CLI dependencies..."
-	uv pip install -r "$tmp_dir/browser_use/skill_cli/requirements-cli.txt"
+	run_step "Installing minimal CLI dependencies" uv pip install -r "$tmp_dir/browser_use/skill_cli/requirements-cli.txt"
 
 	rm -rf "$tmp_dir"
 
@@ -317,8 +370,7 @@ install_chromium() {
 		cmd="$cmd --with-deps"
 	fi
 	cmd="$cmd --no-shell"
-
-	eval $cmd
+	run_shell_step "Installing Chromium browser" "$cmd"
 
 	log_success "Chromium installed"
 }
@@ -327,7 +379,7 @@ install_profile_use() {
 	log_info "Installing profile-use..."
 
 	mkdir -p "$HOME/.browser-use/bin"
-	curl -fsSL https://browser-use.com/profile/cli/install.sh | PROFILE_USE_VERSION=v1.0.2 INSTALL_DIR="$HOME/.browser-use/bin" sh
+	run_shell_step "Installing profile-use" "curl -fsSL https://browser-use.com/profile/cli/install.sh | PROFILE_USE_VERSION=v1.0.2 INSTALL_DIR=\"$HOME/.browser-use/bin\" sh"
 
 	if [ -x "$HOME/.browser-use/bin/profile-use" ]; then
 		log_success "profile-use installed"
@@ -454,6 +506,9 @@ print_next_steps() {
 # =============================================================================
 
 main() {
+	mkdir -p "$(dirname "$INSTALL_LOG_FILE")"
+	: >"$INSTALL_LOG_FILE"
+
 	echo ""
 	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	echo "  Browser-Use Lightweight CLI Installer"
@@ -504,6 +559,10 @@ main() {
 
 	# Step 9: Print next steps
 	print_next_steps
+
+	if [ "$QUIET_INSTALL" = "1" ]; then
+		echo "Install log saved at: $INSTALL_LOG_FILE"
+	fi
 }
 
 # Run main function with all arguments

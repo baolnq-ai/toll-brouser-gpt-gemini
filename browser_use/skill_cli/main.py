@@ -19,6 +19,7 @@ import tempfile
 import time
 import zlib
 from pathlib import Path
+from typing import cast
 
 # =============================================================================
 # Early command interception (before heavy imports)
@@ -204,7 +205,10 @@ def _connect_to_daemon(timeout: float = 60.0, session: str = 'default') -> socke
 		sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 		addr: str | tuple[str, int] = (host, int(port))
 	else:
-		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		af_unix = getattr(socket, 'AF_UNIX', None)
+		if af_unix is None:
+			raise RuntimeError('Unix domain sockets are not supported on this platform')
+		sock = socket.socket(cast(socket.AddressFamily, af_unix), socket.SOCK_STREAM)
 		addr = sock_path
 
 	try:

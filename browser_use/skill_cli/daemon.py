@@ -14,7 +14,7 @@ import logging
 import os
 import signal
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable, cast
 
 if TYPE_CHECKING:
 	from browser_use.skill_cli.sessions import SessionInfo
@@ -54,7 +54,7 @@ class Daemon:
 		self.cloud_proxy_country_code = cloud_proxy_country_code
 		self.cloud_timeout = cloud_timeout
 		self.running = True
-		self._server: asyncio.Server | None = None
+		self._server: asyncio.AbstractServer | None = None
 		self._shutdown_event = asyncio.Event()
 		self._session: SessionInfo | None = None
 		self._shutdown_task: asyncio.Task | None = None
@@ -374,9 +374,10 @@ class Daemon:
 			except NotImplementedError:
 				pass  # Windows doesn't support add_signal_handler
 
-		if hasattr(signal, 'SIGHUP'):
+		sighup = getattr(signal, 'SIGHUP', None)
+		if sighup is not None:
 			try:
-				loop.add_signal_handler(signal.SIGHUP, signal_handler)
+				loop.add_signal_handler(sighup, signal_handler)
 			except NotImplementedError:
 				pass
 
@@ -398,7 +399,14 @@ class Daemon:
 		else:
 			# Unix: socket server
 			Path(sock_path).unlink(missing_ok=True)
-			self._server = await asyncio.start_unix_server(
+			start_unix_server = getattr(asyncio, 'start_unix_server', None)
+			if start_unix_server is None:
+				raise RuntimeError('Unix domain sockets are not supported on this platform')
+			start_unix_server_fn = cast(
+				Callable[..., Awaitable[asyncio.AbstractServer]],
+				start_unix_server,
+			)
+			self._server = await start_unix_server_fn(
 				self.handle_connection,
 				sock_path,
 			)
@@ -408,6 +416,7 @@ class Daemon:
 		my_pid = str(os.getpid())
 		pid_path.write_text(my_pid)
 		self._write_state('ready')
+		assert self._server is not None
 
 		try:
 			async with self._server:

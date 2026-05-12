@@ -1,24 +1,36 @@
 # toll-brouser-gpt-gemini
 
-Local-first Browser Use fork focused on running Gemini and GPT web automation through a single FastAPI bridge.
+Local-first Browser Use fork for Gemini and GPT web automation through one FastAPI bridge.
 
-This repository is tailored for:
-- Local runtime on Windows/Linux/macOS
-- Free-first workflow (use web tabs and your own browser session)
-- One-command bring-up with dependency setup and server startup
-- Stable CDP handling for multi-port endpoint open
+![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/fastapi-bridge-009688?logo=fastapi&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-2ea44f)
 
-## What Is Included
+## What This Repo Solves
 
-- Bridge API server: [examples/apps/gemini-use/server.py](examples/apps/gemini-use/server.py)
-- Setup and bring-up script: [setup.sh](setup.sh)
-- Core Browser Use library source: [browser_use](browser_use)
+This fork is focused on production-like local operation instead of demo-only usage:
 
-The bridge exposes endpoints for:
-- Opening provider tabs via CDP
-- Sending chat prompts to Gemini/GPT tabs
-- Triggering image generation flows
-- Checking and closing managed CDP ports
+- one command bring-up for API bridge and dependencies
+- direct CDP automation for Gemini and GPT browser tabs
+- clear fail-fast behavior for port conflicts
+- free-first workflow using your own browser sessions
+
+Main code locations:
+
+- Bridge server: [examples/apps/gemini-use/server.py](examples/apps/gemini-use/server.py)
+- Bring-up script: [setup.sh](setup.sh)
+- Browser Use source: [browser_use](browser_use)
+
+## Architecture
+
+```mermaid
+flowchart LR
+    C[CLI or Client App] --> A[FastAPI Bridge]
+    A --> D[CDP Session Manager]
+    D --> G[Gemini Tab]
+    D --> P[GPT Tab]
+    A --> S[Port/Health APIs]
+```
 
 ## Quick Start
 
@@ -29,55 +41,80 @@ git clone https://github.com/baolnq-ai/toll-brouser-gpt-gemini.git
 cd toll-brouser-gpt-gemini
 ```
 
-### 2) Setup and run
+### 2) Configure runtime (optional)
+
+```bash
+cp .env.example .env
+```
+
+### 3) Setup and run
 
 ```bash
 ./setup.sh
 ```
 
-What setup does:
-- Detects runtime requirements (Python, Node, uv)
-- Creates/uses local venv
-- Installs dependencies with uv
-- Starts FastAPI bridge server
-- Probes CDP endpoint and can auto-launch Chrome when configured
+The setup script will:
 
-## Default Runtime Config
+- detect Python, Node, and uv
+- create or reuse .venv
+- install project dependencies
+- load .env.example defaults and then .env overrides
+- validate CDP target and start FastAPI bridge
 
-- GEMINI_CDP_URL: http://127.0.0.1:9222
-- GEMINI_API_HOST: 0.0.0.0
-- GEMINI_API_PORT: 8008
-- GEMINI_API_LOG_LEVEL: info
+OpenAPI docs:
 
-Optional:
-- AUTO_LAUNCH_CHROME=1 to auto launch Chrome from setup
-- CHROME_BIN to point to a specific Chrome executable
-- STRICT_CDP_STARTUP=1 to fail fast if CDP is not reachable
-
-Bridge server extras:
-- CHAT_BRIDGE_AUTO_LAUNCH_CHROME=1 enables auto-launch fallback for /v1/web/open when requested CDP port is not live
-- CHAT_BRIDGE_CHROME_BIN overrides Chrome executable discovery for bridge fallback launch
-- CHAT_BRIDGE_CHROME_PROFILE_DIR sets profile root for bridge-launched debug browsers
-
-## API Endpoints
-
-Source: [examples/apps/gemini-use/server.py](examples/apps/gemini-use/server.py)
-
-- POST /v1/web/open
-- POST /v1/ports/ping
-- GET /v1/ports/ping
-- POST /v1/ports/close
-- POST /v1/chat/gemini
-- POST /v1/chat/gpt
-- POST /v1/image/gemini
-- POST /v1/image/gpt
-
-OpenAPI docs when server is running:
 - http://127.0.0.1:8008/docs
+
+## Runtime Configuration
+
+Defaults are defined in [.env.example](.env.example).
+
+### Core Variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| GEMINI_CDP_URL | http://127.0.0.1:9222 | Chrome CDP endpoint used by bridge |
+| GEMINI_API_HOST | 0.0.0.0 | FastAPI bind host |
+| GEMINI_API_PORT | 8008 | FastAPI bind port |
+| GEMINI_API_LOG_LEVEL | info | Uvicorn log level |
+
+### Optional Controls
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| AUTO_LAUNCH_CHROME | 0 | Allow setup script to launch Chrome debug session |
+| STRICT_CDP_STARTUP | 0 | Stop setup immediately if CDP is unreachable |
+| CHROME_BIN | empty | Explicit Chrome executable path |
+| CHAT_BRIDGE_AUTO_LAUNCH_CHROME | 1 | Bridge fallback launch for /v1/web/open |
+| CHAT_BRIDGE_CHROME_BIN | empty | Chrome path override for bridge fallback |
+| CHAT_BRIDGE_CHROME_PROFILE_DIR | empty | Profile root for bridge-launched sessions |
+
+### Port Policy
+
+The project intentionally uses fail-fast semantics:
+
+- no automatic port shifting
+- if GEMINI_API_PORT is busy, setup exits with an actionable error
+- if CDP port from GEMINI_CDP_URL is busy but unreachable, setup exits with an actionable error
+
+## API Surface
+
+All routes are implemented in [examples/apps/gemini-use/server.py](examples/apps/gemini-use/server.py).
+
+| Group | Method | Route | Description |
+| --- | --- | --- | --- |
+| Session | POST | /v1/web/open | Open or reconnect provider tab on a CDP port |
+| Session | GET | /v1/ports/ping | Probe all managed ports |
+| Session | POST | /v1/ports/ping | Probe specific port(s) |
+| Session | POST | /v1/ports/close | Close managed session on port |
+| Chat | POST | /v1/chat/gemini | Send prompt to Gemini tab |
+| Chat | POST | /v1/chat/gpt | Send prompt to GPT tab |
+| Image | POST | /v1/image/gemini | Trigger image generation via Gemini flow |
+| Image | POST | /v1/image/gpt | Trigger image generation via GPT flow |
 
 ## Example Requests
 
-Open Gemini web tab on a specific CDP port:
+Open Gemini tab on CDP port 9223:
 
 ```bash
 curl -X POST "http://127.0.0.1:8008/v1/web/open" \
@@ -91,7 +128,7 @@ curl -X POST "http://127.0.0.1:8008/v1/web/open" \
   }'
 ```
 
-Send chat prompt to Gemini:
+Send prompt to Gemini:
 
 ```bash
 curl -X POST "http://127.0.0.1:8008/v1/chat/gemini" \
@@ -104,46 +141,40 @@ curl -X POST "http://127.0.0.1:8008/v1/chat/gemini" \
 
 ## Troubleshooting
 
-### CDP_CONNECT_FAILED on /v1/web/open
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| CDP_CONNECT_FAILED | CDP endpoint unreachable | Verify GEMINI_CDP_URL and Chrome remote debugging |
+| setup exits on busy port | Port already in use | Free port or update GEMINI_API_PORT / GEMINI_CDP_URL in .env |
+| Chrome not found on Windows | Auto-discovery failed | Set CHROME_BIN and CHAT_BRIDGE_CHROME_BIN explicitly |
 
-If you request a new port (example: 9223) and CDP is not reachable:
-- The bridge now attempts local Chrome auto-launch for that port when CHAT_BRIDGE_AUTO_LAUNCH_CHROME is enabled (default enabled).
-- If auto-launch still fails, inspect response details.auto_launch for exact reason.
-
-Useful checks:
+Quick health check:
 
 ```bash
 curl "http://127.0.0.1:8008/v1/ports/ping"
 ```
 
-### Port conflict
+Setup log files:
 
-setup.sh automatically shifts API/CDP ports when possible.
-
-### Chrome path issues on Windows
-
-Set explicit binary path:
-
-```bash
-export CHROME_BIN="/c/Program Files/Google/Chrome/Application/chrome.exe"
-```
-
-or for bridge fallback launcher:
-
-```bash
-export CHAT_BRIDGE_CHROME_BIN="C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-```
+- .setup.log at repo root
+- .bin-setup.log for [bin/setup.sh](bin/setup.sh)
 
 ## Development
 
-Create environment and sync:
+Create environment and sync dependencies:
 
 ```bash
 uv venv --python 3.11
 uv sync --dev --all-extras
 ```
 
-Run bridge directly:
+Run quality checks:
+
+```bash
+uv run pyright
+./bin/lint.sh
+```
+
+Run bridge server directly:
 
 ```bash
 python examples/apps/gemini-use/server.py
@@ -151,4 +182,4 @@ python examples/apps/gemini-use/server.py
 
 ## License
 
-MIT, same as this repository's [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

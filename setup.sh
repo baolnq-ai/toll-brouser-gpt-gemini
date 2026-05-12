@@ -12,6 +12,10 @@ cd "$ROOT_DIR"
 SETUP_ONLY=0
 ASSUME_YES=0
 OS_FAMILY="unknown"
+SETUP_VERBOSE="${SETUP_VERBOSE:-0}"
+SETUP_LOG_FILE="$ROOT_DIR/.setup.log"
+
+: >"$SETUP_LOG_FILE"
 
 usage() {
 	cat <<'EOF'
@@ -21,11 +25,11 @@ Usage:
 	./setup.sh --yes
 
 Environment variables:
+	Config is loaded in this order: .env.example, then .env (if present)
 	GEMINI_CDP_URL            Default: http://127.0.0.1:9222
 	GEMINI_API_HOST           Default: 0.0.0.0
 	GEMINI_API_PORT           Default: 8008
 	GEMINI_API_LOG_LEVEL      Default: info
-	Ports auto-jump to a free value when possible to avoid conflicts
 	AUTO_LAUNCH_CHROME        Default: 0 (set to 1 to auto launch Chrome with debug port)
 	STRICT_CDP_STARTUP        Default: 0 (set to 1 to fail setup when CDP is unavailable)
 	CHROME_BIN                Optional explicit Chrome binary path
@@ -55,6 +59,86 @@ done
 
 log() {
 	echo "[setup] $*"
+}
+
+log_ok() {
+	echo "[setup][ok] $*"
+}
+
+log_warn() {
+	echo "[setup][warn] $*"
+}
+
+log_error() {
+	echo "[setup][error] $*" >&2
+}
+
+run_step() {
+	local description="$1"
+	shift
+
+	log "$description"
+	if [[ "$SETUP_VERBOSE" == "1" ]]; then
+		if "$@"; then
+			return
+		fi
+	else
+		if "$@" >>"$SETUP_LOG_FILE" 2>&1; then
+			return
+		fi
+	fi
+
+	log_error "$description failed"
+	if [[ "$SETUP_VERBOSE" != "1" ]]; then
+		echo "[setup] Last 60 log lines from $SETUP_LOG_FILE:" >&2
+		tail -n 60 "$SETUP_LOG_FILE" >&2 || true
+	fi
+	exit 1
+}
+
+load_env_file() {
+	local env_file="$1"
+	local overwrite="$2"
+
+	if [[ ! -f "$env_file" ]]; then
+		return
+	fi
+
+	while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+		local line key value
+		line="${raw_line%$'\r'}"
+
+		[[ -z "${line//[[:space:]]/}" ]] && continue
+		[[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+		if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+			key="${BASH_REMATCH[1]}"
+			value="${BASH_REMATCH[2]}"
+
+			if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+				value="${BASH_REMATCH[1]}"
+			elif [[ "$value" =~ ^\'(.*)\'$ ]]; then
+				value="${BASH_REMATCH[1]}"
+			fi
+
+			if [[ "$overwrite" == "1" || -z "${!key+x}" ]]; then
+				export "$key=$value"
+			fi
+		fi
+	done <"$env_file"
+}
+
+load_runtime_env() {
+	local example_env="$ROOT_DIR/.env.example"
+	local project_env="$ROOT_DIR/.env"
+
+	load_env_file "$example_env" "0"
+	if [[ -f "$project_env" ]]; then
+		load_env_file "$project_env" "1"
+		log "loaded runtime config from .env (defaults from .env.example)"
+	else
+		log "loaded runtime defaults from .env.example"
+	fi
 }
 
 detect_os() {
@@ -137,7 +221,11 @@ ensure_brew() {
 		exit 1
 	fi
 
-	/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+	if [[ "$SETUP_VERBOSE" == "1" ]]; then
+		/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+	else
+		/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" >>"$SETUP_LOG_FILE" 2>&1
+	fi
 	if [[ -x /opt/homebrew/bin/brew ]]; then
 		eval "$(/opt/homebrew/bin/brew shellenv)"
 	elif [[ -x /usr/local/bin/brew ]]; then
@@ -192,7 +280,7 @@ ensure_python_runtime() {
 	if find_python_cmd >/dev/null 2>&1; then
 		local found
 		found="$(find_python_cmd)"
-		log "python runtime detected: $found ($($found --version 2>&1))"
+		log_ok "python runtime detected: $found ($($found --version 2>&1))"
 		return
 	fi
 
@@ -251,7 +339,7 @@ install_node_for_os() {
 
 ensure_node_runtime() {
 	if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-		log "node runtime detected: $(node --version), npm $(npm --version)"
+		log_ok "node runtime detected: $(node --version), npm $(npm --version)"
 		return
 	fi
 
@@ -294,66 +382,17 @@ finally:
 PY
 }
 
-find_free_port() {
-	local python_bin="$1"
-	local host="$2"
-	local start_port="$3"
-
-	"$python_bin" - "$host" "$start_port" <<'PY'
-import socket
-import sys
-
-host = sys.argv[1]
-start_port = int(sys.argv[2])
-
-for port in range(start_port, start_port + 200):
-	sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-	if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
-		sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-	try:
-		sock.bind((host, port))
-	except OSError:
-		sock.close()
-		continue
-	else:
-		sock.close()
-		print(port)
-		raise SystemExit(0)
-
-raise SystemExit(1)
-PY
-}
-
-replace_url_port() {
-	local python_bin="$1"
-	local url="$2"
-	local new_port="$3"
-
-	"$python_bin" - "$url" "$new_port" <<'PY'
-from urllib.parse import urlparse, urlunparse
-import sys
-
-url = sys.argv[1]
-new_port = int(sys.argv[2])
-parsed = urlparse(url)
-host = parsed.hostname or '127.0.0.1'
-scheme = parsed.scheme or 'http'
-
-if ':' in host and not host.startswith('['):
-	host = f'[{host}]'
-
-netloc = f'{host}:{new_port}'
-print(urlunparse((scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)))
-PY
-}
-
 ensure_uv() {
 	if command -v uv >/dev/null 2>&1; then
 		return
 	fi
 
 	log "uv not found, installing uv"
-	curl -LsSf https://astral.sh/uv/install.sh | sh
+	if [[ "$SETUP_VERBOSE" == "1" ]]; then
+		curl -LsSf https://astral.sh/uv/install.sh | sh
+	else
+		curl -LsSf https://astral.sh/uv/install.sh | sh >>"$SETUP_LOG_FILE" 2>&1
+	fi
 
 	if [[ -x "$HOME/.local/bin/uv" ]]; then
 		export PATH="$HOME/.local/bin:$PATH"
@@ -381,12 +420,10 @@ resolve_venv_python() {
 
 ensure_venv_and_deps() {
 	if [[ ! -d "$ROOT_DIR/.venv" ]]; then
-		log "creating virtual environment"
-		uv venv --python 3.11
+		run_step "creating virtual environment" uv venv --python 3.11
 	fi
 
-	log "syncing project dependencies"
-	uv sync --dev --all-extras
+	run_step "syncing project dependencies" uv sync --dev --all-extras
 
 	VENV_PYTHON="$(resolve_venv_python)"
 	if [[ -z "$VENV_PYTHON" ]]; then
@@ -399,8 +436,7 @@ import fastapi
 import uvicorn
 PY
 	then
-		log "installing fastapi and uvicorn into project venv"
-		uv pip install --python "$VENV_PYTHON" fastapi uvicorn
+		run_step "installing fastapi and uvicorn into project venv" uv pip install --python "$VENV_PYTHON" fastapi uvicorn
 	fi
 }
 
@@ -412,6 +448,19 @@ extract_cdp_port() {
 		port="9222"
 	fi
 	echo "$port"
+}
+
+extract_url_host() {
+	local python_bin="$1"
+	local raw_url="$2"
+
+	"$python_bin" - "$raw_url" <<'PY'
+from urllib.parse import urlparse
+import sys
+
+parsed = urlparse(sys.argv[1])
+print(parsed.hostname or '127.0.0.1')
+PY
 }
 
 check_cdp_endpoint() {
@@ -455,20 +504,21 @@ maybe_launch_chrome_debug() {
 	local launch_now
 	local requested_cdp_port
 	local cdp_port
+	local cdp_host
 	launch_now="${AUTO_LAUNCH_CHROME:-0}"
 	requested_cdp_port="$(extract_cdp_port "$cdp_url")"
 	cdp_port="$requested_cdp_port"
+	cdp_host="$(extract_url_host "$python_bin" "$cdp_url")"
 
 	if check_cdp_endpoint "$cdp_url"; then
-		log "CDP endpoint is ready at $cdp_url"
+		log_ok "CDP endpoint is ready at $cdp_url"
 		return
 	fi
 
-	if [[ "$launch_now" == "1" ]] && ! port_is_free "$python_bin" "127.0.0.1" "$requested_cdp_port"; then
-		cdp_port="$(find_free_port "$python_bin" "127.0.0.1" "$requested_cdp_port")"
-		cdp_url="$(replace_url_port "$python_bin" "$cdp_url" "$cdp_port")"
-		export GEMINI_CDP_URL="$cdp_url"
-		log "CDP port ${requested_cdp_port} is busy, switched Chrome debug port to ${cdp_port}"
+	if [[ "$cdp_host" == "localhost" || "$cdp_host" == "127.0.0.1" ]] && ! port_is_free "$python_bin" "$cdp_host" "$requested_cdp_port"; then
+		log_error "CDP port ${requested_cdp_port} is already in use and endpoint ${cdp_url}/json/version is not reachable"
+		echo "[setup] Resolve by freeing port ${requested_cdp_port} or updating GEMINI_CDP_URL in .env/.env.example" >&2
+		exit 1
 	fi
 
 	if [[ "$launch_now" != "1" && "$ASSUME_YES" != "1" ]] && [[ -t 0 ]]; then
@@ -487,7 +537,7 @@ EOF
 		if [[ "${STRICT_CDP_STARTUP:-0}" == "1" ]]; then
 			exit 1
 		fi
-		log "continuing without active CDP endpoint (chat/image calls will fail until Chrome debug is available)"
+		log_warn "continuing without active CDP endpoint (chat/image calls will fail until Chrome debug is available)"
 		return
 	fi
 
@@ -512,7 +562,7 @@ EOF
 
 	for _ in $(seq 1 20); do
 		if check_cdp_endpoint "$cdp_url"; then
-			log "CDP endpoint is ready at $cdp_url"
+			log_ok "CDP endpoint is ready at $cdp_url"
 			return
 		fi
 		sleep 1
@@ -522,13 +572,12 @@ EOF
 	if [[ "${STRICT_CDP_STARTUP:-0}" == "1" ]]; then
 		exit 1
 	fi
-	log "continuing without active CDP endpoint"
+	log_warn "continuing without active CDP endpoint"
 }
 
 start_server() {
 	local venv_python="$1"
 	local requested_api_port
-	local free_api_port
 
 	export GEMINI_CDP_URL="${GEMINI_CDP_URL:-http://127.0.0.1:9222}"
 	export GEMINI_API_HOST="${GEMINI_API_HOST:-0.0.0.0}"
@@ -537,9 +586,9 @@ start_server() {
 
 	requested_api_port="$GEMINI_API_PORT"
 	if ! port_is_free "$venv_python" "$GEMINI_API_HOST" "$requested_api_port"; then
-		free_api_port="$(find_free_port "$venv_python" "$GEMINI_API_HOST" "$requested_api_port")"
-		log "API port ${requested_api_port} is busy, switched to ${free_api_port}"
-		export GEMINI_API_PORT="$free_api_port"
+		log_error "API port ${requested_api_port} is already in use on ${GEMINI_API_HOST}"
+		echo "[setup] Update GEMINI_API_PORT in .env/.env.example or stop the process using that port." >&2
+		exit 1
 	fi
 
 	maybe_launch_chrome_debug "$venv_python" "$GEMINI_CDP_URL"
@@ -549,6 +598,7 @@ start_server() {
 }
 
 ensure_uv
+load_runtime_env
 detect_os
 log "detected OS: $OS_FAMILY"
 ensure_python_runtime

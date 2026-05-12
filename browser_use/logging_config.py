@@ -240,21 +240,23 @@ class FIFOHandler(logging.Handler):
 	def __init__(self, fifo_path: str):
 		super().__init__()
 		self.fifo_path = fifo_path
+		self.fd: int | None = None
 		Path(fifo_path).parent.mkdir(parents=True, exist_ok=True)
 
 		# Create FIFO if it doesn't exist
 		if not os.path.exists(fifo_path):
-			os.mkfifo(fifo_path)
-
-		# Don't open the FIFO yet - will open on first write
-		self.fd = None
+			mkfifo_fn = getattr(os, 'mkfifo', None)
+			if mkfifo_fn is None:
+				raise RuntimeError('Named pipes are not supported on this platform')
+			mkfifo_fn(fifo_path)
 
 	def emit(self, record):
 		try:
 			# Open FIFO on first write if not already open
 			if self.fd is None:
 				try:
-					self.fd = os.open(self.fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+					o_nonblock = int(getattr(os, 'O_NONBLOCK', 0))
+					self.fd = os.open(self.fifo_path, os.O_WRONLY | o_nonblock)
 				except OSError:
 					# No reader connected yet, skip this message
 					return

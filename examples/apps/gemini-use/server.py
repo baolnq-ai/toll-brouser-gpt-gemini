@@ -1102,22 +1102,13 @@ class GeminiBridgeService:
 		return self._default_port
 
 	def _build_browser_session(self, cdp_url: str) -> BrowserSession:
-		# Prefer direct BrowserSession construction so runtime fields are explicit.
-		try:
-			return BrowserSession(
-				cdp_url=cdp_url,
-				is_local=False,
-				keep_alive=True,
-				highlight_elements=False,
-			)
-		except Exception:
-			profile = BrowserProfile(
-				cdp_url=cdp_url,
-				is_local=False,
-				keep_alive=True,
-				highlight_elements=False,
-			)
-			return BrowserSession(browser_profile=profile)
+		profile = BrowserProfile(
+			cdp_url=cdp_url,
+			is_local=False,
+			keep_alive=True,
+			highlight_elements=False,
+		)
+		return BrowserSession(browser_profile=profile)
 
 	async def ask(
 		self,

@@ -20,6 +20,7 @@ permissions: {}
 
 jobs:
   trigger_cloud_eval_image_build:
+    if: ${{ github.repository == 'browser-use/browser-use' && secrets.TRIGGER_CLOUD_BUILD_GH_KEY != '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/github-script@v7
